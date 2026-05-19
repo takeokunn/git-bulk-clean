@@ -1,0 +1,6 @@
+[package]
+name = "git-bulk-clean"
+version = "0.1.0"
+edition = "2021"
+description = "Automatically traverse Git repositories and perform optimization and cleanup"
+license = "MIT"
