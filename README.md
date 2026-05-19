@@ -130,7 +130,7 @@ Each repository runs through these phases in order. All phases are attempted eve
 | 4 | `git reflog expire --expire=<REFLOG_EXPIRE> --all` | always |
 | 5 | `git maintenance run --task=loose-objects` | always |
 | 6 | `git maintenance run --task=incremental-repack` | normal mode |
-| 6 | `git repack -a -d -f --delta-base-offset` | aggressive mode |
+| 6 | `git repack -a -d -f` | aggressive mode |
 | 7 | `git gc --auto` | normal mode |
 | 7 | `git gc --aggressive --prune=all` | aggressive mode |
 | 8 | `git maintenance run --task=commit-graph` | always |

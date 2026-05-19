@@ -162,13 +162,17 @@ impl CleanOptions {
 
 // ── logging ──────────────────────────────────────────────────────────────────
 
+fn format_timestamp(secs: u64) -> String {
+    let (h, m, s) = ((secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
 fn log(msg: &str) {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let (h, m, s) = ((secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
-    eprintln!("[git-bulk-clean {h:02}:{m:02}:{s:02}] {msg}");
+    eprintln!("[git-bulk-clean {}] {msg}", format_timestamp(secs));
 }
 
 // ── repo collection ──────────────────────────────────────────────────────────
@@ -295,8 +299,8 @@ fn phase_objects_normal(dir: &str) -> bool {
 }
 
 fn phase_objects_aggressive(dir: &str) -> bool {
-    // Full repack: -f ignores existing deltas, --delta-base-offset shrinks pack size
-    let ok = git(dir, &["repack", "-a", "-d", "-f", "--delta-base-offset"]);
+    // Full repack: -a packs everything, -d removes redundant packs, -f forces re-deltaing
+    let ok = git(dir, &["repack", "-a", "-d", "-f"]);
     ok & git(dir, &["gc", "--aggressive", "--prune=all"])
 }
 
@@ -338,7 +342,7 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
         ));
         log(&format!("  (dry-run) git maintenance run --task=loose-objects"));
         if opts.aggressive {
-            log(&format!("  (dry-run) git repack -a -d -f --delta-base-offset"));
+            log(&format!("  (dry-run) git repack -a -d -f -a -d -f"));
             log(&format!("  (dry-run) git gc --aggressive --prune=all"));
         } else {
             log(&format!(
@@ -462,105 +466,143 @@ fn run_cycle(cfg: &Config, dry_run: bool) -> CycleStats {
 
 // ── cli ───────────────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
+enum CliAction {
+    Help,
+    Version,
+    GenerateCompletions(String),
+    List,
+    Run { daemon: bool, dry_run: bool },
+}
+
+fn parse_args(flags: &[String]) -> Result<CliAction, String> {
+    if flags.iter().any(|a| a == "-h" || a == "--help") {
+        return Ok(CliAction::Help);
+    }
+    if flags.iter().any(|a| a == "-V" || a == "--version") {
+        return Ok(CliAction::Version);
+    }
+    if let Some(pos) = flags.iter().position(|a| a == "--generate-completions") {
+        return match flags.get(pos + 1).map(String::as_str) {
+            Some("bash") | Some("zsh") | Some("fish") => {
+                Ok(CliAction::GenerateCompletions(flags[pos + 1].clone()))
+            }
+            Some(other) => Err(format!(
+                "unknown shell {other:?}; supported: bash, zsh, fish"
+            )),
+            None => Err(
+                "--generate-completions requires a shell argument (bash, zsh, fish)".to_string(),
+            ),
+        };
+    }
+    if flags.iter().any(|a| a == "--list") {
+        return Ok(CliAction::List);
+    }
+    Ok(CliAction::Run {
+        daemon: flags.iter().any(|a| a == "--daemon"),
+        dry_run: flags.iter().any(|a| a == "--dry-run"),
+    })
+}
+
+fn help_text(prog: &str) -> String {
+    format!(
+"Usage: {prog} [OPTIONS]
+
+Options:
+  --daemon                      Loop forever, sleeping MAINTENANCE_INTERVAL between cycles
+  --dry-run                     Show what would run without executing git commands
+  --list                        Print discovered repositories and exit
+  --generate-completions SHELL  Print completion script (bash, zsh, fish) and exit
+  --version                     Print version and exit
+  -h, --help                    Print this help and exit
+
+Environment variables:
+  MAINTENANCE_REPOS              Comma-separated repo paths
+  MAINTENANCE_GHQ_ENABLE         true → include all ghq-managed repos
+  MAINTENANCE_REFLOG_EXPIRE      Reflog cutoff (default: {DEFAULT_REFLOG_EXPIRE})
+  MAINTENANCE_AGGRESSIVE         true → full repack + gc --aggressive
+  MAINTENANCE_INTERVAL           Daemon sleep interval in seconds (default: {DEFAULT_INTERVAL_SECS})
+  MAINTENANCE_WORKERS            Parallel workers (default: {DEFAULT_WORKERS})
+  MAINTENANCE_SKIP_SUBMODULES    true → skip submodule cleanup
+  MAINTENANCE_SKIP_LFS           true → skip git-lfs prune
+
+Cleanup pipeline (per repo):
+  1. git fetch --all --prune --prune-tags
+  2. git pack-refs --all
+  3. git worktree prune
+  4. git reflog expire --expire=<REFLOG_EXPIRE> --all
+  5. git maintenance run --task=loose-objects
+  6. git maintenance run --task=incremental-repack  (normal)
+     git repack -a -d -f -a -d -f        (aggressive)
+  7. git gc --auto                                   (normal)
+     git gc --aggressive --prune=all                (aggressive)
+  8. git maintenance run --task=commit-graph
+  9. git submodule sync + foreach gc                 (if .gitmodules, non-bare only)
+ 10. git lfs prune                                   (if LFS configured)
+"
+    )
+}
+
 fn print_help(prog: &str) {
-    eprintln!("Usage: {prog} [OPTIONS]");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --daemon                      Loop forever, sleeping MAINTENANCE_INTERVAL between cycles");
-    eprintln!("  --dry-run                     Show what would run without executing git commands");
-    eprintln!("  --list                        Print discovered repositories and exit");
-    eprintln!("  --generate-completions SHELL  Print completion script (bash, zsh, fish) and exit");
-    eprintln!("  --version                     Print version and exit");
-    eprintln!("  -h, --help                    Print this help and exit");
-    eprintln!();
-    eprintln!("Environment variables:");
-    eprintln!("  MAINTENANCE_REPOS              Comma-separated repo paths");
-    eprintln!("  MAINTENANCE_GHQ_ENABLE         true → include all ghq-managed repos");
-    eprintln!("  MAINTENANCE_REFLOG_EXPIRE      Reflog cutoff (default: {DEFAULT_REFLOG_EXPIRE})");
-    eprintln!("  MAINTENANCE_AGGRESSIVE         true → full repack + gc --aggressive");
-    eprintln!("  MAINTENANCE_INTERVAL           Daemon sleep interval in seconds (default: {DEFAULT_INTERVAL_SECS})");
-    eprintln!("  MAINTENANCE_WORKERS            Parallel workers (default: {DEFAULT_WORKERS})");
-    eprintln!("  MAINTENANCE_SKIP_SUBMODULES    true → skip submodule cleanup");
-    eprintln!("  MAINTENANCE_SKIP_LFS           true → skip git-lfs prune");
-    eprintln!();
-    eprintln!("Cleanup pipeline (per repo):");
-    eprintln!("  1. git fetch --all --prune --prune-tags");
-    eprintln!("  2. git pack-refs --all");
-    eprintln!("  3. git worktree prune");
-    eprintln!("  4. git reflog expire --expire=<REFLOG_EXPIRE> --all");
-    eprintln!("  5. git maintenance run --task=loose-objects");
-    eprintln!("  6. git maintenance run --task=incremental-repack  (normal)");
-    eprintln!("     git repack -a -d -f --delta-base-offset        (aggressive)");
-    eprintln!("  7. git gc --auto                                   (normal)");
-    eprintln!("     git gc --aggressive --prune=all                 (aggressive)");
-    eprintln!("  8. git maintenance run --task=commit-graph");
-    eprintln!("  9. git submodule sync + foreach gc                 (if .gitmodules, non-bare only)");
-    eprintln!(" 10. git lfs prune                                   (if LFS configured)");
+    eprint!("{}", help_text(prog));
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     let prog = args.first().map(String::as_str).unwrap_or("git-bulk-clean");
+    let flags: &[String] = args.get(1..).unwrap_or_default();
 
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        print_help(prog);
-        return;
-    }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
-        eprintln!("git-bulk-clean {VERSION}");
-        return;
-    }
-
-    if let Some(pos) = args.iter().position(|a| a == "--generate-completions") {
-        match args.get(pos + 1).map(String::as_str) {
-            Some("bash") => { print!("{COMPLETION_BASH}"); return; }
-            Some("zsh")  => { print!("{COMPLETION_ZSH}"); return; }
-            Some("fish") => { print!("{COMPLETION_FISH}"); return; }
-            Some(other) => {
-                eprintln!("error: unknown shell {other:?}; supported: bash, zsh, fish");
-                std::process::exit(2);
+    match parse_args(flags) {
+        Ok(CliAction::Help) => {
+            print_help(prog);
+        }
+        Ok(CliAction::Version) => {
+            eprintln!("git-bulk-clean {VERSION}");
+        }
+        Ok(CliAction::GenerateCompletions(shell)) => {
+            let script = match shell.as_str() {
+                "bash" => COMPLETION_BASH,
+                "zsh"  => COMPLETION_ZSH,
+                "fish" => COMPLETION_FISH,
+                _      => unreachable!("parse_args guarantees a valid shell"),
+            };
+            print!("{script}");
+        }
+        Ok(CliAction::List) => {
+            let cfg = Config::from_env();
+            let repos = collect_repos(&cfg);
+            if repos.is_empty() {
+                log("no repositories found");
             }
-            None => {
-                eprintln!("error: --generate-completions requires a shell argument (bash, zsh, fish)");
-                std::process::exit(2);
+            for repo in repos {
+                println!("{}  {}", if repo.is_bare { "bare" } else { "norm" }, repo.path);
             }
         }
-    }
-
-    let cfg = Config::from_env();
-
-    if args.iter().any(|a| a == "--list") {
-        let repos = collect_repos(&cfg);
-        if repos.is_empty() {
-            log("no repositories found");
+        Ok(CliAction::Run { daemon, dry_run }) => {
+            let cfg = Config::from_env();
+            if dry_run {
+                log("dry-run mode — no git commands will be executed");
+            }
+            if daemon {
+                log(&format!(
+                    "daemon mode — interval {}s, {} workers",
+                    cfg.interval_secs, cfg.num_workers
+                ));
+                loop {
+                    run_cycle(&cfg, dry_run);
+                    log(&format!("sleeping {}s", cfg.interval_secs));
+                    thread::sleep(Duration::from_secs(cfg.interval_secs));
+                }
+            } else {
+                let stats = run_cycle(&cfg, dry_run);
+                if stats.failed > 0 {
+                    std::process::exit(1);
+                }
+            }
         }
-        for repo in repos {
-            println!("{}  {}", if repo.is_bare { "bare" } else { "norm" }, repo.path);
-        }
-        return;
-    }
-
-    let daemon = args.iter().any(|a| a == "--daemon");
-    let dry_run = args.iter().any(|a| a == "--dry-run");
-
-    if dry_run {
-        log("dry-run mode — no git commands will be executed");
-    }
-
-    if daemon {
-        log(&format!(
-            "daemon mode — interval {}s, {} workers",
-            cfg.interval_secs, cfg.num_workers
-        ));
-        loop {
-            run_cycle(&cfg, dry_run);
-            log(&format!("sleeping {}s", cfg.interval_secs));
-            thread::sleep(Duration::from_secs(cfg.interval_secs));
-        }
-    } else {
-        let stats = run_cycle(&cfg, dry_run);
-        if stats.failed > 0 {
-            std::process::exit(1);
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            std::process::exit(2);
         }
     }
 }
@@ -804,8 +846,378 @@ mod tests {
 
     #[test]
     fn log_timestamp_format() {
-        let secs: u64 = 3661; // 01:01:01
-        let (h, m, s) = ((secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
-        assert_eq!(format!("{h:02}:{m:02}:{s:02}"), "01:01:01");
+        assert_eq!(format_timestamp(3661), "01:01:01");
+    }
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn make_temp_git_repo(name: &str) -> std::path::PathBuf {
+        let tmp = env::temp_dir().join(format!("git_bulk_clean_{name}"));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        Command::new("git").args(["init"]).current_dir(&tmp).output().unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t.com"])
+            .current_dir(&tmp)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "T"])
+            .current_dir(&tmp)
+            .output()
+            .unwrap();
+        fs::write(tmp.join("f"), "x").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&tmp).output().unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&tmp)
+            .output()
+            .unwrap();
+        tmp
+    }
+
+    // ── format_timestamp ─────────────────────────────────────────────────────
+
+    #[test]
+    fn format_timestamp_zero_is_midnight() {
+        assert_eq!(format_timestamp(0), "00:00:00");
+    }
+
+    #[test]
+    fn format_timestamp_noon() {
+        assert_eq!(format_timestamp(12 * 3600), "12:00:00");
+    }
+
+    #[test]
+    fn format_timestamp_wraps_at_86400() {
+        assert_eq!(format_timestamp(86400), "00:00:00");
+        assert_eq!(format_timestamp(86400 + 3661), "01:01:01");
+    }
+
+    // ── bool_var ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bool_var_absent_returns_default() {
+        let get = |_k: &str| Err::<String, _>(env::VarError::NotPresent);
+        assert!(!bool_var(&get, "X", false));
+        assert!(bool_var(&get, "X", true));
+    }
+
+    #[test]
+    fn bool_var_case_insensitive_true() {
+        for val in ["true", "TRUE", "True", "tRuE"] {
+            let v = val.to_string();
+            let get = |_k: &str| Ok::<String, env::VarError>(v.clone());
+            assert!(bool_var(&get, "X", false), "expected true for {val:?}");
+        }
+    }
+
+    #[test]
+    fn bool_var_non_true_values_are_false() {
+        for val in ["false", "FALSE", "1", "yes", "on", "0", "no"] {
+            let v = val.to_string();
+            let get = |_k: &str| Ok::<String, env::VarError>(v.clone());
+            assert!(!bool_var(&get, "X", false), "expected false for {val:?}");
+        }
+    }
+
+    // ── CleanOptions ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn clean_options_mirrors_config_fields() {
+        let cfg = make_config(&[
+            ("MAINTENANCE_REFLOG_EXPIRE", "90.days.ago"),
+            ("MAINTENANCE_AGGRESSIVE", "true"),
+            ("MAINTENANCE_SKIP_SUBMODULES", "true"),
+            ("MAINTENANCE_SKIP_LFS", "true"),
+        ]);
+        let opts = CleanOptions::from_config(&cfg);
+        assert_eq!(opts.reflog_expire, "90.days.ago");
+        assert!(opts.aggressive);
+        assert!(opts.skip_submodules);
+        assert!(opts.skip_lfs);
+    }
+
+    #[test]
+    fn clean_options_defaults_are_off() {
+        let opts = CleanOptions::from_config(&make_config(&[]));
+        assert_eq!(opts.reflog_expire, DEFAULT_REFLOG_EXPIRE);
+        assert!(!opts.aggressive);
+        assert!(!opts.skip_submodules);
+        assert!(!opts.skip_lfs);
+    }
+
+    // ── parse_args ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_args_empty_gives_run_defaults() {
+        assert!(matches!(
+            parse_args(&strs(&[])),
+            Ok(CliAction::Run { daemon: false, dry_run: false })
+        ));
+    }
+
+    #[test]
+    fn parse_args_help_short() {
+        assert!(matches!(parse_args(&strs(&["-h"])), Ok(CliAction::Help)));
+    }
+
+    #[test]
+    fn parse_args_help_long() {
+        assert!(matches!(parse_args(&strs(&["--help"])), Ok(CliAction::Help)));
+    }
+
+    #[test]
+    fn parse_args_version_short() {
+        assert!(matches!(parse_args(&strs(&["-V"])), Ok(CliAction::Version)));
+    }
+
+    #[test]
+    fn parse_args_version_long() {
+        assert!(matches!(parse_args(&strs(&["--version"])), Ok(CliAction::Version)));
+    }
+
+    #[test]
+    fn parse_args_generate_completions_bash() {
+        let Ok(CliAction::GenerateCompletions(s)) =
+            parse_args(&strs(&["--generate-completions", "bash"]))
+        else {
+            panic!("expected GenerateCompletions");
+        };
+        assert_eq!(s, "bash");
+    }
+
+    #[test]
+    fn parse_args_generate_completions_zsh() {
+        let Ok(CliAction::GenerateCompletions(s)) =
+            parse_args(&strs(&["--generate-completions", "zsh"]))
+        else {
+            panic!("expected GenerateCompletions");
+        };
+        assert_eq!(s, "zsh");
+    }
+
+    #[test]
+    fn parse_args_generate_completions_fish() {
+        let Ok(CliAction::GenerateCompletions(s)) =
+            parse_args(&strs(&["--generate-completions", "fish"]))
+        else {
+            panic!("expected GenerateCompletions");
+        };
+        assert_eq!(s, "fish");
+    }
+
+    #[test]
+    fn parse_args_generate_completions_unknown_shell() {
+        let err = parse_args(&strs(&["--generate-completions", "powershell"])).unwrap_err();
+        assert!(err.contains("powershell"), "error should name the unknown shell");
+    }
+
+    #[test]
+    fn parse_args_generate_completions_missing_arg() {
+        assert!(parse_args(&strs(&["--generate-completions"])).is_err());
+    }
+
+    #[test]
+    fn parse_args_list() {
+        assert!(matches!(parse_args(&strs(&["--list"])), Ok(CliAction::List)));
+    }
+
+    #[test]
+    fn parse_args_daemon_only() {
+        assert!(matches!(
+            parse_args(&strs(&["--daemon"])),
+            Ok(CliAction::Run { daemon: true, dry_run: false })
+        ));
+    }
+
+    #[test]
+    fn parse_args_dry_run_only() {
+        assert!(matches!(
+            parse_args(&strs(&["--dry-run"])),
+            Ok(CliAction::Run { daemon: false, dry_run: true })
+        ));
+    }
+
+    #[test]
+    fn parse_args_daemon_and_dry_run() {
+        assert!(matches!(
+            parse_args(&strs(&["--daemon", "--dry-run"])),
+            Ok(CliAction::Run { daemon: true, dry_run: true })
+        ));
+    }
+
+    // ── help_text ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn help_text_contains_all_flags_and_env_vars() {
+        let text = help_text("git-bulk-clean");
+        for flag in &[
+            "--daemon",
+            "--dry-run",
+            "--list",
+            "--version",
+            "--help",
+            "--generate-completions",
+        ] {
+            assert!(text.contains(flag), "help text missing flag {flag}");
+        }
+        for var in &[
+            "MAINTENANCE_REPOS",
+            "MAINTENANCE_GHQ_ENABLE",
+            "MAINTENANCE_REFLOG_EXPIRE",
+            "MAINTENANCE_AGGRESSIVE",
+            "MAINTENANCE_INTERVAL",
+            "MAINTENANCE_WORKERS",
+            "MAINTENANCE_SKIP_SUBMODULES",
+            "MAINTENANCE_SKIP_LFS",
+        ] {
+            assert!(text.contains(var), "help text missing env var {var}");
+        }
+    }
+
+    // ── git() ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn git_fn_succeeds_on_valid_command() {
+        assert!(git(env!("CARGO_MANIFEST_DIR"), &["status"]));
+    }
+
+    #[test]
+    fn git_fn_fails_on_invalid_subcommand() {
+        assert!(!git(env!("CARGO_MANIFEST_DIR"), &["not-a-real-subcommand-xyz"]));
+    }
+
+    // ── has_lfs ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn has_lfs_false_on_project_root() {
+        assert!(!has_lfs(env!("CARGO_MANIFEST_DIR")));
+    }
+
+    #[test]
+    fn has_lfs_true_when_filter_lfs_configured() {
+        let tmp = make_temp_git_repo("has_lfs_true");
+        Command::new("git")
+            .args(["config", "filter.lfs.clean", "git-lfs clean -- %f"])
+            .current_dir(&tmp)
+            .output()
+            .unwrap();
+        assert!(has_lfs(tmp.to_str().unwrap()));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── phase functions ──────────────────────────────────────────────────────
+
+    #[test]
+    fn phase_fetch_on_repo_without_remotes_does_not_panic() {
+        let tmp = make_temp_git_repo("phase_fetch");
+        let _ = phase_fetch(tmp.to_str().unwrap());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_refs_on_fresh_repo_succeeds() {
+        let tmp = make_temp_git_repo("phase_refs");
+        assert!(phase_refs(tmp.to_str().unwrap(), "30.days.ago"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_objects_normal_on_fresh_repo_does_not_panic() {
+        let tmp = make_temp_git_repo("phase_objects_normal");
+        let _ = phase_objects_normal(tmp.to_str().unwrap());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_objects_aggressive_on_fresh_repo_succeeds() {
+        let tmp = make_temp_git_repo("phase_objects_aggressive");
+        assert!(phase_objects_aggressive(tmp.to_str().unwrap()));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_indices_on_fresh_repo_does_not_panic() {
+        let tmp = make_temp_git_repo("phase_indices");
+        let _ = phase_indices(tmp.to_str().unwrap());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_submodules_on_repo_without_submodules_does_not_panic() {
+        let tmp = make_temp_git_repo("phase_submodules");
+        let _ = phase_submodules(tmp.to_str().unwrap());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_lfs_on_repo_without_lfs_does_not_panic() {
+        let tmp = make_temp_git_repo("phase_lfs");
+        let _ = phase_lfs(tmp.to_str().unwrap());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── clean_repo ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn clean_repo_dry_run_normal_returns_true() {
+        let repo = RepoInfo { path: env!("CARGO_MANIFEST_DIR").to_string(), is_bare: false };
+        let opts = CleanOptions::from_config(&make_config(&[]));
+        assert!(clean_repo(&repo, &opts, true, 1, 1));
+    }
+
+    #[test]
+    fn clean_repo_dry_run_aggressive_returns_true() {
+        let repo = RepoInfo { path: env!("CARGO_MANIFEST_DIR").to_string(), is_bare: false };
+        let opts = CleanOptions::from_config(&make_config(&[("MAINTENANCE_AGGRESSIVE", "true")]));
+        assert!(clean_repo(&repo, &opts, true, 1, 1));
+    }
+
+    #[test]
+    fn clean_repo_dry_run_bare_returns_true() {
+        // Pretend the project root is a bare repo to exercise the bare branch
+        let repo = RepoInfo { path: env!("CARGO_MANIFEST_DIR").to_string(), is_bare: true };
+        let opts = CleanOptions::from_config(&make_config(&[]));
+        assert!(clean_repo(&repo, &opts, true, 1, 1));
+    }
+
+    #[test]
+    fn clean_repo_live_on_temp_repo_does_not_panic() {
+        let tmp = make_temp_git_repo("clean_repo_live");
+        let repo = RepoInfo { path: tmp.to_str().unwrap().to_string(), is_bare: false };
+        let opts = CleanOptions::from_config(&make_config(&[("MAINTENANCE_SKIP_LFS", "true")]));
+        let _ = clean_repo(&repo, &opts, false, 1, 1);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── run_cycle ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn run_cycle_no_repos_returns_zero_failures() {
+        let stats = run_cycle(&make_config(&[]), false);
+        assert_eq!(stats.failed, 0);
+    }
+
+    #[test]
+    fn run_cycle_dry_run_returns_zero_failures() {
+        let cfg = make_config(&[("MAINTENANCE_REPOS", env!("CARGO_MANIFEST_DIR"))]);
+        let stats = run_cycle(&cfg, true);
+        assert_eq!(stats.failed, 0);
+    }
+
+    #[test]
+    fn run_cycle_live_on_temp_repo_does_not_panic() {
+        let tmp = make_temp_git_repo("run_cycle_live");
+        let cfg = make_config(&[
+            ("MAINTENANCE_REPOS", tmp.to_str().unwrap()),
+            ("MAINTENANCE_SKIP_LFS", "true"),
+        ]);
+        let _ = run_cycle(&cfg, false);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
