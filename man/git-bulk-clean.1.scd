@@ -76,7 +76,7 @@ working tree (worktree prune, submodule operations) are skipped for them.
 *MAINTENANCE_AGGRESSIVE*
 	Set to _true_ to use the aggressive repack strategy.
 	Replaces the incremental-repack task with a full
-	_git repack -a -d -f --delta-base-offset_ and replaces
+	_git repack -a -d -f_ and replaces
 	_git gc --auto_ with _git gc --aggressive --prune=all_.
 	Significantly slower but produces smaller packs. Default: _false_.
 
