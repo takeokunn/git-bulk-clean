@@ -36,7 +36,9 @@
 
           meta = {
             description = "Parallel Git repository maintenance CLI/daemon";
+            homepage = "https://github.com/takeokunn/git-bulk-clean";
             license = pkgs.lib.licenses.mit;
+            maintainers = [ pkgs.lib.maintainers.takeokunn ];
             mainProgram = "git-bulk-clean";
           };
         };
