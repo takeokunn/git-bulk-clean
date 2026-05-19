@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ── constants ────────────────────────────────────────────────────────────────
 
-const NUM_WORKERS: usize = 5;
+const DEFAULT_WORKERS: usize = 5;
 const DEFAULT_REFLOG_EXPIRE: &str = "30.days.ago";
 const DEFAULT_INTERVAL_SECS: u64 = 86400;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -24,6 +24,7 @@ struct Config {
     reflog_expire: String,
     aggressive: bool,
     interval_secs: u64,
+    num_workers: usize,
     skip_submodules: bool,
     skip_lfs: bool,
 }
@@ -54,6 +55,11 @@ impl Config {
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(DEFAULT_INTERVAL_SECS),
+            num_workers: get("MAINTENANCE_WORKERS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(DEFAULT_WORKERS),
             skip_submodules: bool_var(&get, "MAINTENANCE_SKIP_SUBMODULES", false),
             skip_lfs: bool_var(&get, "MAINTENANCE_SKIP_LFS", false),
         }
@@ -69,6 +75,25 @@ where
         .unwrap_or(default)
 }
 
+// Subset of Config needed by the cleanup pipeline. Shared across workers via Arc.
+struct CleanOptions {
+    reflog_expire: String,
+    aggressive: bool,
+    skip_submodules: bool,
+    skip_lfs: bool,
+}
+
+impl CleanOptions {
+    fn from_config(cfg: &Config) -> Self {
+        CleanOptions {
+            reflog_expire: cfg.reflog_expire.clone(),
+            aggressive: cfg.aggressive,
+            skip_submodules: cfg.skip_submodules,
+            skip_lfs: cfg.skip_lfs,
+        }
+    }
+}
+
 // ── logging ──────────────────────────────────────────────────────────────────
 
 fn log(msg: &str) {
@@ -81,6 +106,11 @@ fn log(msg: &str) {
 }
 
 // ── repo collection ──────────────────────────────────────────────────────────
+
+struct RepoInfo {
+    path: String,
+    is_bare: bool,
+}
 
 fn ghq_repos() -> Vec<String> {
     Command::new("ghq")
@@ -103,16 +133,30 @@ fn ghq_repos() -> Vec<String> {
         })
 }
 
-fn collect_repos(cfg: &Config) -> Vec<String> {
+// Returns None if dir is not a git repo, Some(true) if bare, Some(false) if normal.
+// A single git call covers both the validity check and the bare/normal distinction.
+fn detect_repo_kind(dir: &str) -> Option<bool> {
+    Command::new("git")
+        .args(["rev-parse", "--is-bare-repository"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "true")
+}
+
+fn collect_repos(cfg: &Config) -> Vec<RepoInfo> {
     let mut seen: HashSet<String> = cfg.repos.iter().cloned().collect();
     if cfg.ghq_enable {
         seen.extend(ghq_repos());
     }
-    let mut repos: Vec<String> = seen
+    let mut repos: Vec<RepoInfo> = seen
         .into_iter()
         .filter(|p| Path::new(p).is_dir())
+        .filter_map(|p| detect_repo_kind(&p).map(|is_bare| RepoInfo { path: p, is_bare }))
         .collect();
-    repos.sort();
+    repos.sort_by(|a, b| a.path.cmp(&b.path));
     repos
 }
 
@@ -142,30 +186,6 @@ fn git(dir: &str, args: &[&str]) -> bool {
     }
 }
 
-fn git_lfs(dir: &str, args: &[&str]) -> bool {
-    match Command::new("git-lfs")
-        .args(args)
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-    {
-        Ok(o) if o.status.success() => true,
-        Ok(o) => {
-            let msg = String::from_utf8_lossy(&o.stderr);
-            let msg = msg.trim();
-            if !msg.is_empty() {
-                log(&format!("{dir}: `git lfs {}` — {msg}", args.join(" ")));
-            }
-            false
-        }
-        Err(e) => {
-            log(&format!("{dir}: `git lfs {}` — {e}", args.join(" ")));
-            false
-        }
-    }
-}
-
 // ── repo feature detection ────────────────────────────────────────────────────
 
 fn has_submodules(dir: &str) -> bool {
@@ -173,7 +193,7 @@ fn has_submodules(dir: &str) -> bool {
 }
 
 fn has_lfs(dir: &str) -> bool {
-    // git config --local filter.lfs.clean is set iff git-lfs was ever enabled here
+    // filter.lfs.clean is set iff git-lfs was ever initialised in this repo
     Command::new("git")
         .args(["config", "--local", "--get-regexp", "filter\\.lfs\\."])
         .current_dir(dir)
@@ -187,12 +207,11 @@ fn has_lfs(dir: &str) -> bool {
 // ── cleanup phases ────────────────────────────────────────────────────────────
 
 fn phase_fetch(dir: &str) -> bool {
-    // --prune-tags removes tags deleted on the remote; --prune handles branches
+    // --prune-tags also removes tags deleted on the remote (--prune covers branches)
     git(dir, &["fetch", "--all", "--prune", "--prune-tags"])
 }
 
 fn phase_refs(dir: &str, reflog_expire: &str) -> bool {
-    // Pack all loose refs into packed-refs for faster ref lookup
     let ok = git(dir, &["pack-refs", "--all"]);
     let ok = ok & git(dir, &["worktree", "prune"]);
     ok & git(
@@ -202,16 +221,15 @@ fn phase_refs(dir: &str, reflog_expire: &str) -> bool {
 }
 
 fn phase_objects_normal(dir: &str) -> bool {
-    // loose-objects and incremental-repack run unconditionally (unlike gc --auto
-    // which skips when below thresholds), then gc finalises pruning
+    // loose-objects + incremental-repack run unconditionally (gc --auto only runs
+    // above its internal thresholds), then gc finalises pruning
     let ok = git(dir, &["maintenance", "run", "--task=loose-objects"]);
     let ok = ok & git(dir, &["maintenance", "run", "--task=incremental-repack"]);
     ok & git(dir, &["gc", "--auto"])
 }
 
 fn phase_objects_aggressive(dir: &str) -> bool {
-    // Full repack with delta re-computation, then aggressive gc
-    // -f: ignore existing deltas; --delta-base-offset: smaller pack files
+    // Full repack: -f ignores existing deltas, --delta-base-offset shrinks pack size
     let ok = git(dir, &["repack", "-a", "-d", "-f", "--delta-base-offset"]);
     ok & git(dir, &["gc", "--aggressive", "--prune=all"])
 }
@@ -221,7 +239,6 @@ fn phase_indices(dir: &str) -> bool {
 }
 
 fn phase_submodules(dir: &str) -> bool {
-    // Sync remote URLs then run gc on each submodule
     let ok = git(dir, &["submodule", "sync", "--recursive"]);
     ok & git(
         dir,
@@ -230,15 +247,20 @@ fn phase_submodules(dir: &str) -> bool {
 }
 
 fn phase_lfs(dir: &str) -> bool {
-    // Remove LFS objects not referenced by any reachable commit
-    git_lfs(dir, &["prune"])
+    // Route through git's exec-path so git-lfs is resolved the same way the
+    // user's shell would find it (handles PATH-independent Nix setups)
+    git(dir, &["lfs", "prune"])
 }
 
 // ── per-repo cleanup orchestration ───────────────────────────────────────────
 
-fn clean_repo(dir: &str, cfg: &Config, dry_run: bool) -> bool {
+fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, total: usize) -> bool {
+    let dir = &repo.path;
     let t = Instant::now();
-    log(&format!("cleaning: {dir}"));
+    log(&format!(
+        "[{n}/{total}] cleaning: {dir}{}",
+        if repo.is_bare { " (bare)" } else { "" }
+    ));
 
     if dry_run {
         log(&format!("  (dry-run) git fetch --all --prune --prune-tags"));
@@ -246,51 +268,50 @@ fn clean_repo(dir: &str, cfg: &Config, dry_run: bool) -> bool {
         log(&format!("  (dry-run) git worktree prune"));
         log(&format!(
             "  (dry-run) git reflog expire --expire={} --all",
-            cfg.reflog_expire
+            opts.reflog_expire
         ));
         log(&format!("  (dry-run) git maintenance run --task=loose-objects"));
-        log(&format!(
-            "  (dry-run) git maintenance run --task=incremental-repack"
-        ));
-        if cfg.aggressive {
-            log(&format!(
-                "  (dry-run) git repack -a -d -f --delta-base-offset"
-            ));
+        if opts.aggressive {
+            log(&format!("  (dry-run) git repack -a -d -f --delta-base-offset"));
             log(&format!("  (dry-run) git gc --aggressive --prune=all"));
         } else {
+            log(&format!(
+                "  (dry-run) git maintenance run --task=incremental-repack"
+            ));
             log(&format!("  (dry-run) git gc --auto"));
         }
         log(&format!(
             "  (dry-run) git maintenance run --task=commit-graph"
         ));
-        if !cfg.skip_submodules && has_submodules(dir) {
+        if !repo.is_bare && !opts.skip_submodules && has_submodules(dir) {
             log(&format!("  (dry-run) git submodule sync --recursive"));
             log(&format!(
                 "  (dry-run) git submodule foreach --recursive git gc --auto"
             ));
         }
-        if !cfg.skip_lfs && has_lfs(dir) {
+        if !opts.skip_lfs && has_lfs(dir) {
             log(&format!("  (dry-run) git lfs prune"));
         }
         return true;
     }
 
     let ok = phase_fetch(dir)
-        & phase_refs(dir, &cfg.reflog_expire)
-        & if cfg.aggressive {
+        & phase_refs(dir, &opts.reflog_expire)
+        & if opts.aggressive {
             phase_objects_aggressive(dir)
         } else {
             phase_objects_normal(dir)
         }
         & phase_indices(dir);
 
-    let ok = if !cfg.skip_submodules && has_submodules(dir) {
+    // Submodule cleanup requires a working tree — skip for bare repos
+    let ok = if !repo.is_bare && !opts.skip_submodules && has_submodules(dir) {
         ok & phase_submodules(dir)
     } else {
         ok
     };
 
-    let ok = if !cfg.skip_lfs && has_lfs(dir) {
+    let ok = if !opts.skip_lfs && has_lfs(dir) {
         ok & phase_lfs(dir)
     } else {
         ok
@@ -298,7 +319,7 @@ fn clean_repo(dir: &str, cfg: &Config, dry_run: bool) -> bool {
 
     let ms = t.elapsed().as_millis();
     log(&format!(
-        "{dir}: done in {ms}ms ({})",
+        "[{n}/{total}] {dir}: done in {ms}ms ({})",
         if ok { "ok" } else { "some errors" }
     ));
     ok
@@ -307,8 +328,6 @@ fn clean_repo(dir: &str, cfg: &Config, dry_run: bool) -> bool {
 // ── worker pool ───────────────────────────────────────────────────────────────
 
 struct CycleStats {
-    #[allow(dead_code)]
-    total: usize,
     failed: usize,
 }
 
@@ -318,52 +337,44 @@ fn run_cycle(cfg: &Config, dry_run: bool) -> CycleStats {
 
     if total == 0 {
         log("no repositories found");
-        return CycleStats { total: 0, failed: 0 };
+        return CycleStats { failed: 0 };
     }
 
-    log(&format!("starting cycle: {total} repositories, {NUM_WORKERS} workers"));
+    let bare_count = repos.iter().filter(|r| r.is_bare).count();
+    log(&format!(
+        "starting cycle: {total} repositories ({bare_count} bare), {} workers",
+        cfg.num_workers
+    ));
 
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (tx, rx) = std::sync::mpsc::channel::<RepoInfo>();
     let rx = Arc::new(Mutex::new(rx));
     let failed_count = Arc::new(AtomicUsize::new(0));
+    let progress = Arc::new(AtomicUsize::new(0));
+    let opts = Arc::new(CleanOptions::from_config(cfg));
 
     for repo in repos {
-        tx.send(repo).unwrap();
+        tx.send(repo).expect("channel send");
     }
     drop(tx);
 
-    let reflog_expire = Arc::new(cfg.reflog_expire.clone());
-    let aggressive = cfg.aggressive;
-    let skip_submodules = cfg.skip_submodules;
-    let skip_lfs = cfg.skip_lfs;
-
-    let handles: Vec<_> = (0..NUM_WORKERS)
+    let handles: Vec<_> = (0..cfg.num_workers)
         .map(|id| {
             let rx = Arc::clone(&rx);
+            let opts = Arc::clone(&opts);
             let failed_count = Arc::clone(&failed_count);
-            let reflog_expire = Arc::clone(&reflog_expire);
+            let progress = Arc::clone(&progress);
 
-            thread::spawn(move || {
-                let cfg = Config {
-                    repos: vec![],
-                    ghq_enable: false,
-                    reflog_expire: (*reflog_expire).clone(),
-                    aggressive,
-                    interval_secs: DEFAULT_INTERVAL_SECS,
-                    skip_submodules,
-                    skip_lfs,
-                };
-                loop {
-                    match rx.lock().unwrap().recv() {
-                        Ok(dir) => {
-                            if !clean_repo(&dir, &cfg, dry_run) {
-                                failed_count.fetch_add(1, Ordering::Relaxed);
-                            }
+            thread::spawn(move || loop {
+                match rx.lock().unwrap().recv() {
+                    Ok(repo) => {
+                        let n = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                        if !clean_repo(&repo, &opts, dry_run, n, total) {
+                            failed_count.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(_) => {
-                            log(&format!("worker {id}: done"));
-                            break;
-                        }
+                    }
+                    Err(_) => {
+                        log(&format!("worker {id}: done"));
+                        break;
                     }
                 }
             })
@@ -380,7 +391,7 @@ fn run_cycle(cfg: &Config, dry_run: bool) -> CycleStats {
         "cycle complete — {succeeded}/{total} ok, {failed} failed"
     ));
 
-    CycleStats { total, failed }
+    CycleStats { failed }
 }
 
 // ── cli ───────────────────────────────────────────────────────────────────────
@@ -391,6 +402,7 @@ fn print_help(prog: &str) {
     eprintln!("Options:");
     eprintln!("  --daemon      Loop forever, sleeping MAINTENANCE_INTERVAL between cycles");
     eprintln!("  --dry-run     Show what would run without executing git commands");
+    eprintln!("  --list        Print discovered repositories and exit");
     eprintln!("  --version     Print version and exit");
     eprintln!("  -h, --help    Print this help and exit");
     eprintln!();
@@ -400,6 +412,7 @@ fn print_help(prog: &str) {
     eprintln!("  MAINTENANCE_REFLOG_EXPIRE      Reflog cutoff (default: {DEFAULT_REFLOG_EXPIRE})");
     eprintln!("  MAINTENANCE_AGGRESSIVE         true → full repack + gc --aggressive");
     eprintln!("  MAINTENANCE_INTERVAL           Daemon sleep interval in seconds (default: {DEFAULT_INTERVAL_SECS})");
+    eprintln!("  MAINTENANCE_WORKERS            Parallel workers (default: {DEFAULT_WORKERS})");
     eprintln!("  MAINTENANCE_SKIP_SUBMODULES    true → skip submodule cleanup");
     eprintln!("  MAINTENANCE_SKIP_LFS           true → skip git-lfs prune");
     eprintln!();
@@ -414,7 +427,7 @@ fn print_help(prog: &str) {
     eprintln!("  7. git gc --auto                                   (normal)");
     eprintln!("     git gc --aggressive --prune=all                 (aggressive)");
     eprintln!("  8. git maintenance run --task=commit-graph");
-    eprintln!("  9. git submodule sync + foreach gc                 (if .gitmodules found)");
+    eprintln!("  9. git submodule sync + foreach gc                 (if .gitmodules, non-bare only)");
     eprintln!(" 10. git lfs prune                                   (if LFS configured)");
 }
 
@@ -431,6 +444,19 @@ fn main() {
         return;
     }
 
+    let cfg = Config::from_env();
+
+    if args.iter().any(|a| a == "--list") {
+        let repos = collect_repos(&cfg);
+        if repos.is_empty() {
+            log("no repositories found");
+        }
+        for repo in repos {
+            println!("{}  {}", if repo.is_bare { "bare" } else { "norm" }, repo.path);
+        }
+        return;
+    }
+
     let daemon = args.iter().any(|a| a == "--daemon");
     let dry_run = args.iter().any(|a| a == "--dry-run");
 
@@ -438,12 +464,10 @@ fn main() {
         log("dry-run mode — no git commands will be executed");
     }
 
-    let cfg = Config::from_env();
-
     if daemon {
         log(&format!(
-            "daemon mode — interval {}s",
-            cfg.interval_secs
+            "daemon mode — interval {}s, {} workers",
+            cfg.interval_secs, cfg.num_workers
         ));
         loop {
             run_cycle(&cfg, dry_run);
@@ -474,8 +498,6 @@ mod tests {
                 .ok_or(env::VarError::NotPresent)
         })
     }
-
-    // dedup helpers used by collect_repos
 
     fn dedup_sorted(lists: Vec<Vec<String>>) -> Vec<String> {
         let mut seen: HashSet<String> = HashSet::new();
@@ -525,8 +547,6 @@ mod tests {
         assert_eq!(got, ["/a", "/m", "/z"]);
     }
 
-    // Config parsing
-
     #[test]
     fn config_defaults() {
         let cfg = make_config(&[]);
@@ -535,6 +555,7 @@ mod tests {
         assert_eq!(cfg.reflog_expire, DEFAULT_REFLOG_EXPIRE);
         assert!(!cfg.aggressive);
         assert_eq!(cfg.interval_secs, DEFAULT_INTERVAL_SECS);
+        assert_eq!(cfg.num_workers, DEFAULT_WORKERS);
         assert!(!cfg.skip_submodules);
         assert!(!cfg.skip_lfs);
     }
@@ -547,6 +568,7 @@ mod tests {
             ("MAINTENANCE_REFLOG_EXPIRE", "7.days.ago"),
             ("MAINTENANCE_AGGRESSIVE", "true"),
             ("MAINTENANCE_INTERVAL", "3600"),
+            ("MAINTENANCE_WORKERS", "8"),
             ("MAINTENANCE_SKIP_SUBMODULES", "true"),
             ("MAINTENANCE_SKIP_LFS", "true"),
         ]);
@@ -555,6 +577,7 @@ mod tests {
         assert_eq!(cfg.reflog_expire, "7.days.ago");
         assert!(cfg.aggressive);
         assert_eq!(cfg.interval_secs, 3600);
+        assert_eq!(cfg.num_workers, 8);
         assert!(cfg.skip_submodules);
         assert!(cfg.skip_lfs);
     }
@@ -572,6 +595,12 @@ mod tests {
     }
 
     #[test]
+    fn config_workers_zero_falls_back() {
+        let cfg = make_config(&[("MAINTENANCE_WORKERS", "0")]);
+        assert_eq!(cfg.num_workers, DEFAULT_WORKERS);
+    }
+
+    #[test]
     fn config_bool_case_insensitive() {
         for val in ["true", "TRUE", "True"] {
             let cfg = make_config(&[("MAINTENANCE_GHQ_ENABLE", val)]);
@@ -583,24 +612,35 @@ mod tests {
         }
     }
 
-    // collect_repos: dedup + missing-path filter
-
     #[test]
-    fn collect_deduplicates_and_ignores_missing() {
-        let tmp = env::temp_dir().join("git_bulk_clean_collect_test");
-        let _ = fs::create_dir_all(&tmp);
-        let real = tmp.to_string_lossy().to_string();
-
+    fn collect_deduplicates_and_validates_git_repo() {
+        // CARGO_MANIFEST_DIR is the project root — a real, non-bare git repo
+        let repo_path = env!("CARGO_MANIFEST_DIR").to_string();
         let cfg = make_config(&[(
             "MAINTENANCE_REPOS",
-            &format!("{real},{real},/no-such-path-xyz"),
+            &format!("{repo_path},{repo_path},/no-such-path-xyz"),
         )]);
         let repos = collect_repos(&cfg);
-        assert_eq!(repos, vec![real]);
-        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].path, repo_path);
+        assert!(!repos[0].is_bare, "project repo should not be bare");
     }
 
-    // Feature detection
+    #[test]
+    fn detect_repo_kind_project_is_non_bare() {
+        let kind = detect_repo_kind(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(kind, Some(false));
+    }
+
+    #[test]
+    fn detect_repo_kind_non_repo_returns_none() {
+        // Create a temp dir that is not a git repo
+        let tmp = env::temp_dir().join("git_bulk_clean_nonrepo_test");
+        let _ = fs::create_dir_all(&tmp);
+        let kind = detect_repo_kind(tmp.to_str().unwrap());
+        assert!(kind.is_none(), "plain directory should not be detected as a repo");
+        let _ = fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn has_submodules_detects_gitmodules() {
@@ -612,13 +652,10 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    // Timestamp format
-
     #[test]
     fn log_timestamp_format() {
         let secs: u64 = 3661; // 01:01:01
         let (h, m, s) = ((secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
-        let ts = format!("{h:02}:{m:02}:{s:02}");
-        assert_eq!(ts, "01:01:01");
+        assert_eq!(format!("{h:02}:{m:02}:{s:02}"), "01:01:01");
     }
 }
