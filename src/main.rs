@@ -16,6 +16,72 @@ const DEFAULT_REFLOG_EXPIRE: &str = "30.days.ago";
 const DEFAULT_INTERVAL_SECS: u64 = 86400;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// ── shell completions ─────────────────────────────────────────────────────────
+
+const COMPLETION_BASH: &str = r#"# bash completion for git-bulk-clean
+
+_git_bulk_clean() {
+    local cur prev
+    _init_completion 2>/dev/null || {
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+    }
+
+    if [[ "${prev}" == "--generate-completions" ]]; then
+        COMPREPLY=($(compgen -W "bash zsh fish" -- "${cur}"))
+        return 0
+    fi
+
+    COMPREPLY=($(compgen -W "
+        --daemon
+        --dry-run
+        --list
+        --version
+        -V
+        --help
+        -h
+        --generate-completions
+    " -- "${cur}"))
+}
+
+complete -F _git_bulk_clean git-bulk-clean
+"#;
+
+const COMPLETION_ZSH: &str = r#"#compdef git-bulk-clean
+
+_git_bulk_clean() {
+    local -a opts
+    opts=(
+        '--daemon[loop forever, sleeping MAINTENANCE_INTERVAL between cycles]'
+        '--dry-run[show what would run without executing git commands]'
+        '--list[print discovered repositories and exit]'
+        '--version[print version and exit]'
+        '-V[print version and exit]'
+        '--help[print this help and exit]'
+        '-h[print this help and exit]'
+        '--generate-completions[print shell completion script]:shell:(bash zsh fish)'
+    )
+
+    _arguments -s $opts
+}
+
+_git_bulk_clean "$@"
+"#;
+
+const COMPLETION_FISH: &str = r#"# fish completion for git-bulk-clean
+
+complete -c git-bulk-clean -f
+
+complete -c git-bulk-clean -l daemon                -d 'Loop forever, sleeping MAINTENANCE_INTERVAL between cycles'
+complete -c git-bulk-clean -l dry-run               -d 'Show what would run without executing git commands'
+complete -c git-bulk-clean -l list                  -d 'Print discovered repositories and exit'
+complete -c git-bulk-clean -l version               -d 'Print version and exit'
+complete -c git-bulk-clean -s V                     -d 'Print version and exit'
+complete -c git-bulk-clean -l help                  -d 'Print this help and exit'
+complete -c git-bulk-clean -s h                     -d 'Print this help and exit'
+complete -c git-bulk-clean -l generate-completions  -r -a 'bash zsh fish' -d 'Print shell completion script for given shell'
+"#;
+
 // ── config ───────────────────────────────────────────────────────────────────
 
 struct Config {
@@ -400,11 +466,12 @@ fn print_help(prog: &str) {
     eprintln!("Usage: {prog} [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --daemon      Loop forever, sleeping MAINTENANCE_INTERVAL between cycles");
-    eprintln!("  --dry-run     Show what would run without executing git commands");
-    eprintln!("  --list        Print discovered repositories and exit");
-    eprintln!("  --version     Print version and exit");
-    eprintln!("  -h, --help    Print this help and exit");
+    eprintln!("  --daemon                      Loop forever, sleeping MAINTENANCE_INTERVAL between cycles");
+    eprintln!("  --dry-run                     Show what would run without executing git commands");
+    eprintln!("  --list                        Print discovered repositories and exit");
+    eprintln!("  --generate-completions SHELL  Print completion script (bash, zsh, fish) and exit");
+    eprintln!("  --version                     Print version and exit");
+    eprintln!("  -h, --help                    Print this help and exit");
     eprintln!();
     eprintln!("Environment variables:");
     eprintln!("  MAINTENANCE_REPOS              Comma-separated repo paths");
@@ -442,6 +509,22 @@ fn main() {
     if args.iter().any(|a| a == "-V" || a == "--version") {
         eprintln!("git-bulk-clean {VERSION}");
         return;
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--generate-completions") {
+        match args.get(pos + 1).map(String::as_str) {
+            Some("bash") => { print!("{COMPLETION_BASH}"); return; }
+            Some("zsh")  => { print!("{COMPLETION_ZSH}"); return; }
+            Some("fish") => { print!("{COMPLETION_FISH}"); return; }
+            Some(other) => {
+                eprintln!("error: unknown shell {other:?}; supported: bash, zsh, fish");
+                std::process::exit(2);
+            }
+            None => {
+                eprintln!("error: --generate-completions requires a shell argument (bash, zsh, fish)");
+                std::process::exit(2);
+            }
+        }
     }
 
     let cfg = Config::from_env();
@@ -650,6 +733,73 @@ mod tests {
         fs::write(tmp.join(".gitmodules"), "[submodule]\n").unwrap();
         assert!(has_submodules(tmp.to_str().unwrap()));
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    const ALL_FLAGS: &[&str] = &[
+        "--daemon",
+        "--dry-run",
+        "--list",
+        "--version",
+        "--help",
+        "--generate-completions",
+    ];
+
+    #[test]
+    fn completion_bash_contains_all_flags() {
+        for flag in ALL_FLAGS {
+            assert!(
+                COMPLETION_BASH.contains(flag),
+                "bash completion missing {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_zsh_contains_all_flags() {
+        for flag in ALL_FLAGS {
+            assert!(
+                COMPLETION_ZSH.contains(flag),
+                "zsh completion missing {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_fish_contains_all_flags() {
+        // fish uses `-l <name>` syntax, not `--<name>`
+        const FISH_FLAGS: &[&str] = &[
+            "-l daemon",
+            "-l dry-run",
+            "-l list",
+            "-l version",
+            "-l help",
+            "-l generate-completions",
+        ];
+        for flag in FISH_FLAGS {
+            assert!(
+                COMPLETION_FISH.contains(flag),
+                "fish completion missing {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_bash_handles_generate_completions_subarg() {
+        assert!(COMPLETION_BASH.contains("bash"));
+        assert!(COMPLETION_BASH.contains("zsh"));
+        assert!(COMPLETION_BASH.contains("fish"));
+    }
+
+    #[test]
+    fn completion_zsh_generate_completions_has_shell_choices() {
+        assert!(COMPLETION_ZSH.contains("bash"));
+        assert!(COMPLETION_ZSH.contains("zsh"));
+        assert!(COMPLETION_ZSH.contains("fish"));
+    }
+
+    #[test]
+    fn completion_fish_generate_completions_requires_argument() {
+        assert!(COMPLETION_FISH.contains("-r") || COMPLETION_FISH.contains("--require-parameter"));
     }
 
     #[test]
