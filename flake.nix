@@ -23,7 +23,7 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [ pkgs.makeWrapper ];
+          nativeBuildInputs = [ pkgs.makeWrapper pkgs.scdoc ];
 
           postInstall = ''
             wrapProgram $out/bin/git-bulk-clean \
@@ -32,6 +32,18 @@
                 pkgs.ghq
                 pkgs.coreutils
               ]}
+
+            # completions
+            install -Dm644 completions/git-bulk-clean.bash \
+              $out/share/bash-completion/completions/git-bulk-clean
+            install -Dm644 completions/git-bulk-clean.zsh \
+              $out/share/zsh/site-functions/_git-bulk-clean
+            install -Dm644 completions/git-bulk-clean.fish \
+              $out/share/fish/vendor_completions.d/git-bulk-clean.fish
+
+            # man page
+            mkdir -p $out/share/man/man1
+            scdoc < man/git-bulk-clean.1.scd > $out/share/man/man1/git-bulk-clean.1
           '';
 
           meta = {
