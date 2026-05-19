@@ -190,6 +190,11 @@ MAINTENANCE_REPOS=/path/to/repo MAINTENANCE_AGGRESSIVE=true git-bulk-clean
 
 # Custom workers
 MAINTENANCE_GHQ_ENABLE=true MAINTENANCE_WORKERS=8 git-bulk-clean
+
+# Shell completions: source directly or pipe to a file
+git-bulk-clean --generate-completions fish | source
+git-bulk-clean --generate-completions bash > ~/.bash_completion.d/git-bulk-clean
+git-bulk-clean --generate-completions zsh > ~/.zsh/completions/_git-bulk-clean
 ```
 
 Exit code is `0` on full success, `1` if any repository encountered errors.

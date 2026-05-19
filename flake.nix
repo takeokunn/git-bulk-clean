@@ -33,12 +33,12 @@
                 pkgs.coreutils
               ]}
 
-            # completions
-            install -Dm644 completions/git-bulk-clean.bash \
+            # completions (generated from the binary itself)
+            install -Dm644 <($out/bin/git-bulk-clean --generate-completions bash) \
               $out/share/bash-completion/completions/git-bulk-clean
-            install -Dm644 completions/git-bulk-clean.zsh \
+            install -Dm644 <($out/bin/git-bulk-clean --generate-completions zsh) \
               $out/share/zsh/site-functions/_git-bulk-clean
-            install -Dm644 completions/git-bulk-clean.fish \
+            install -Dm644 <($out/bin/git-bulk-clean --generate-completions fish) \
               $out/share/fish/vendor_completions.d/git-bulk-clean.fish
 
             # man page

@@ -7,6 +7,7 @@ git-bulk-clean - parallel Git repository maintenance CLI/daemon
 # SYNOPSIS
 
 *git-bulk-clean* [--daemon] [--dry-run] [--list] [--version] [--help]
+               [--generate-completions bash|zsh|fish]
 
 # DESCRIPTION
 
@@ -47,6 +48,15 @@ working tree (worktree prune, submodule operations) are skipped for them.
 
 *--help*, *-h*
 	Print a short usage summary and exit.
+
+*--generate-completions* _shell_
+	Print the shell completion script for _shell_ (one of _bash_, _zsh_,
+	or _fish_) to standard output and exit. Intended for shell
+	configuration:
+
+	```
+	git-bulk-clean --generate-completions fish | source
+	```
 
 # ENVIRONMENT
 
