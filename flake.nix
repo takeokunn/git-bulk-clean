@@ -3,75 +3,105 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs }:
     let
-      # homeManagerModules is system-agnostic, so it lives outside the
-      # per-system loop and receives `self` so the module can resolve the
-      # package for the caller's system at evaluation time.
+      supportedSystems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+      pkgsFor = system: nixpkgs.legacyPackages.${system};
+
       homeManagerModules.default = import ./hm-module.nix { inherit self; };
     in
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
+    {
+      packages = forAllSystems (system:
+        let
+          pkgs = pkgsFor system;
+          git-bulk-clean = pkgs.rustPlatform.buildRustPackage {
+            pname = "git-bulk-clean";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
 
-        git-bulk-clean = pkgs.rustPlatform.buildRustPackage {
-          pname = "git-bulk-clean";
-          version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = [ pkgs.makeWrapper pkgs.scdoc ];
 
-          nativeBuildInputs = [ pkgs.makeWrapper pkgs.scdoc ];
+            postInstall = ''
+              wrapProgram $out/bin/git-bulk-clean \
+                --prefix PATH : ${pkgs.lib.makeBinPath [
+                  pkgs.git
+                  pkgs.ghq
+                  pkgs.coreutils
+                ]}
 
-          postInstall = ''
-            wrapProgram $out/bin/git-bulk-clean \
-              --prefix PATH : ${pkgs.lib.makeBinPath [
-                pkgs.git
-                pkgs.ghq
-                pkgs.coreutils
-              ]}
+              install -Dm644 <($out/bin/git-bulk-clean --generate-completions bash) \
+                $out/share/bash-completion/completions/git-bulk-clean
+              install -Dm644 <($out/bin/git-bulk-clean --generate-completions zsh) \
+                $out/share/zsh/site-functions/_git-bulk-clean
+              install -Dm644 <($out/bin/git-bulk-clean --generate-completions fish) \
+                $out/share/fish/vendor_completions.d/git-bulk-clean.fish
 
-            # completions (generated from the binary itself)
-            install -Dm644 <($out/bin/git-bulk-clean --generate-completions bash) \
-              $out/share/bash-completion/completions/git-bulk-clean
-            install -Dm644 <($out/bin/git-bulk-clean --generate-completions zsh) \
-              $out/share/zsh/site-functions/_git-bulk-clean
-            install -Dm644 <($out/bin/git-bulk-clean --generate-completions fish) \
-              $out/share/fish/vendor_completions.d/git-bulk-clean.fish
+              mkdir -p $out/share/man/man1
+              scdoc < man/git-bulk-clean.1.scd > $out/share/man/man1/git-bulk-clean.1
+            '';
 
-            # man page
-            mkdir -p $out/share/man/man1
-            scdoc < man/git-bulk-clean.1.scd > $out/share/man/man1/git-bulk-clean.1
-          '';
-
-          meta = {
-            description = "Parallel Git repository maintenance CLI/daemon";
-            homepage = "https://github.com/takeokunn/git-bulk-clean";
-            license = pkgs.lib.licenses.mit;
-            maintainers = [ pkgs.lib.maintainers.takeokunn ];
-            mainProgram = "git-bulk-clean";
+            meta = {
+              description = "Parallel Git repository maintenance CLI/daemon";
+              homepage = "https://github.com/takeokunn/git-bulk-clean";
+              license = pkgs.lib.licenses.mit;
+              maintainers = [ pkgs.lib.maintainers.takeokunn ];
+              mainProgram = "git-bulk-clean";
+            };
           };
-        };
-      in
-      {
-        packages.default = git-bulk-clean;
+        in
+        { default = git-bulk-clean; });
 
-        apps.default = flake-utils.lib.mkApp {
-          drv = git-bulk-clean;
-        };
+      apps = forAllSystems (system:
+        {
+          default = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/git-bulk-clean";
+          };
+        });
 
-        devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            cargo
-            rustc
-            clippy
-            rustfmt
-            git
-            ghq
-          ];
-        };
-      }
-    ) // { inherit homeManagerModules; };
+      devShells = forAllSystems (system:
+        let
+          pkgs = pkgsFor system;
+        in
+        {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              cargo
+              rustc
+              clippy
+              rustfmt
+              git
+              ghq
+              nixd
+            ];
+            shellHook = ''
+              cat <<'USAGE_EOF'
+
+=== git-bulk-clean Development Shell ===
+
+Build & run:
+  cargo build           # Debug build
+  cargo build --release # Release build
+  cargo run -- --help   # Run with args
+
+Test & lint:
+  cargo test            # Run all tests
+  cargo clippy          # Lint
+  cargo fmt             # Format
+
+Nix build:
+  nix build             # Build via Nix (uses Cargo.lock)
+  nix flake check       # Run checks in sandbox
+
+USAGE_EOF
+            '';
+          };
+        });
+
+      inherit homeManagerModules;
+    };
 }

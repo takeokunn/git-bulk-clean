@@ -64,6 +64,16 @@ in
         # Run at lowest CPU and I/O priority to avoid impacting system load
         Nice = 19;
         IOSchedulingClass = "idle";
+
+        # Security hardening
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        ProtectSystem = "strict";
+        MemoryDenyWriteExecute = true;
+        RestrictNamespaces = true;
+        LockPersonality = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
       };
 
       Install = {

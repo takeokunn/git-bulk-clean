@@ -172,32 +172,132 @@ home.packages = [ inputs.git-bulk-clean.packages.${pkgs.system}.default ];
 
 ## Usage
 
-```sh
-# One-shot: clean all configured repos and exit
-MAINTENANCE_GHQ_ENABLE=true git-bulk-clean
+### Synopsis
 
-# Dry-run: print every command without executing
-MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --dry-run
-
-# List discovered repositories (norm / bare)
-MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --list
-
-# Daemon: clean forever, sleeping MAINTENANCE_INTERVAL seconds between cycles
-MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --daemon
-
-# Aggressive: full repack + gc --aggressive
-MAINTENANCE_REPOS=/path/to/repo MAINTENANCE_AGGRESSIVE=true git-bulk-clean
-
-# Custom workers
-MAINTENANCE_GHQ_ENABLE=true MAINTENANCE_WORKERS=8 git-bulk-clean
-
-# Shell completions: source directly or pipe to a file
-git-bulk-clean --generate-completions fish | source
-git-bulk-clean --generate-completions bash > ~/.bash_completion.d/git-bulk-clean
-git-bulk-clean --generate-completions zsh > ~/.zsh/completions/_git-bulk-clean
+```
+git-bulk-clean [OPTIONS]
 ```
 
+All repository discovery and tuning is done via environment variables — there are no positional arguments.
+
+---
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| _(none)_ | One-shot: clean every discovered repository and exit |
+| `--daemon` | Loop forever, sleeping `MAINTENANCE_INTERVAL` seconds between cycles |
+| `--dry-run` | Print every git command that would run — nothing is executed |
+| `--list` | Print all discovered repositories (`norm` / `bare`) and exit |
+| `--generate-completions SHELL` | Print the completion script for `bash`, `zsh`, or `fish` and exit |
+| `-V`, `--version` | Print version and exit |
+| `-h`, `--help` | Print a usage summary and exit |
+
 Exit code is `0` on full success, `1` if any repository encountered errors.
+
+---
+
+### Common recipes
+
+#### Explore before you run
+
+Always start with `--list` and `--dry-run` to verify what will happen:
+
+```sh
+# See which repositories were discovered
+MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --list
+
+# See every git command that would be executed, without running any
+MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --dry-run
+```
+
+#### One-shot: clean everything managed by ghq
+
+```sh
+MAINTENANCE_GHQ_ENABLE=true git-bulk-clean
+```
+
+#### One-shot: clean a specific set of repositories
+
+```sh
+MAINTENANCE_REPOS=/path/to/repo1,/path/to/repo2 git-bulk-clean
+```
+
+#### Combine ghq and explicit paths
+
+```sh
+MAINTENANCE_GHQ_ENABLE=true \
+  MAINTENANCE_REPOS=/path/to/extra/repo \
+  git-bulk-clean
+```
+
+#### Run as a daemon (every 24 hours)
+
+```sh
+MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --daemon
+```
+
+#### Run as a daemon every 6 hours with aggressive GC
+
+```sh
+MAINTENANCE_GHQ_ENABLE=true \
+  MAINTENANCE_INTERVAL=21600 \
+  MAINTENANCE_AGGRESSIVE=true \
+  git-bulk-clean --daemon
+```
+
+`--aggressive` replaces `git gc --auto` with `git gc --aggressive --prune=all` and uses a full `git repack -a -d -f` instead of incremental repacking. Significantly slower, but produces the smallest possible pack files.
+
+#### Use more parallel workers for a large collection
+
+```sh
+MAINTENANCE_GHQ_ENABLE=true MAINTENANCE_WORKERS=12 git-bulk-clean
+```
+
+Default is 5 workers. Set higher if your disk I/O can handle it.
+
+#### Skip submodules or LFS for a quick pass
+
+```sh
+MAINTENANCE_GHQ_ENABLE=true \
+  MAINTENANCE_SKIP_SUBMODULES=true \
+  MAINTENANCE_SKIP_LFS=true \
+  git-bulk-clean
+```
+
+#### Set a longer reflog expiry
+
+```sh
+MAINTENANCE_GHQ_ENABLE=true MAINTENANCE_REFLOG_EXPIRE=90.days.ago git-bulk-clean
+```
+
+Any date string accepted by git works: `90.days.ago`, `2024-01-01`, `never`.
+
+---
+
+### Shell completions
+
+Source directly (fish):
+
+```sh
+git-bulk-clean --generate-completions fish | source
+```
+
+Install permanently:
+
+```sh
+# bash
+git-bulk-clean --generate-completions bash > ~/.bash_completion.d/git-bulk-clean
+
+# zsh
+git-bulk-clean --generate-completions zsh > ~/.zsh/completions/_git-bulk-clean
+
+# fish
+git-bulk-clean --generate-completions fish > ~/.config/fish/completions/git-bulk-clean.fish
+```
+
+When installed via Nix (`nix build` or the Home Manager module), completion files are installed automatically into the correct locations — no manual step required.
 
 ---
 

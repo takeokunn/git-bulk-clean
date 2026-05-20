@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_WORKERS: usize = 5;
 const DEFAULT_REFLOG_EXPIRE: &str = "30.days.ago";
 const DEFAULT_INTERVAL_SECS: u64 = 86400;
+const MAX_WORKERS: usize = 256;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── shell completions ─────────────────────────────────────────────────────────
@@ -114,8 +115,16 @@ impl Config {
         Config {
             repos,
             ghq_enable: bool_var(&get, "MAINTENANCE_GHQ_ENABLE", false),
-            reflog_expire: get("MAINTENANCE_REFLOG_EXPIRE")
-                .unwrap_or_else(|_| DEFAULT_REFLOG_EXPIRE.to_string()),
+            reflog_expire: {
+                let v = get("MAINTENANCE_REFLOG_EXPIRE")
+                    .unwrap_or_else(|_| DEFAULT_REFLOG_EXPIRE.to_string());
+                if is_valid_reflog_expire(&v) {
+                    v
+                } else {
+                    eprintln!("[git-bulk-clean] warning: MAINTENANCE_REFLOG_EXPIRE {:?} rejected (dangerous value), using default", v);
+                    DEFAULT_REFLOG_EXPIRE.to_string()
+                }
+            },
             aggressive: bool_var(&get, "MAINTENANCE_AGGRESSIVE", false),
             interval_secs: get("MAINTENANCE_INTERVAL")
                 .ok()
@@ -125,6 +134,7 @@ impl Config {
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .filter(|&n| n > 0)
+                .map(|n| n.min(MAX_WORKERS))
                 .unwrap_or(DEFAULT_WORKERS),
             skip_submodules: bool_var(&get, "MAINTENANCE_SKIP_SUBMODULES", false),
             skip_lfs: bool_var(&get, "MAINTENANCE_SKIP_LFS", false),
@@ -139,6 +149,20 @@ where
     get(key)
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(default)
+}
+
+fn is_valid_reflog_expire(v: &str) -> bool {
+    let v = v.trim();
+    // "never" safely disables expiry
+    if v == "never" {
+        return true;
+    }
+    // "now" and "all" expire everything immediately — dangerous
+    if matches!(v, "now" | "all") {
+        return false;
+    }
+    // Allow alphanumeric, '.', '-', space: covers "30.days.ago", "YYYY-MM-DD", "90 days ago"
+    v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ' ')
 }
 
 // Subset of Config needed by the cleanup pipeline. Shared across workers via Arc.
@@ -175,6 +199,12 @@ fn log(msg: &str) {
     eprintln!("[git-bulk-clean {}] {msg}", format_timestamp(secs));
 }
 
+fn sanitize_for_log(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 // ── repo collection ──────────────────────────────────────────────────────────
 
 struct RepoInfo {
@@ -207,6 +237,10 @@ fn ghq_repos() -> Vec<String> {
 // A single git call covers both the validity check and the bare/normal distinction.
 fn detect_repo_kind(dir: &str) -> Option<bool> {
     Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
         .args(["rev-parse", "--is-bare-repository"])
         .current_dir(dir)
         .output()
@@ -234,6 +268,14 @@ fn collect_repos(cfg: &Config) -> Vec<RepoInfo> {
 
 fn git(dir: &str, args: &[&str]) -> bool {
     match Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "credential.helper")
+        .env("GIT_CONFIG_VALUE_1", "")
+        .env("GIT_CONFIG_KEY_2", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_2", "false")
         .args(args)
         .current_dir(dir)
         .stdout(Stdio::null())
@@ -245,12 +287,12 @@ fn git(dir: &str, args: &[&str]) -> bool {
             let msg = String::from_utf8_lossy(&o.stderr);
             let msg = msg.trim();
             if !msg.is_empty() {
-                log(&format!("{dir}: `git {}` — {msg}", args.join(" ")));
+                log(&format!("{}: `git {}` — {}", sanitize_for_log(dir), args.join(" "), sanitize_for_log(msg)));
             }
             false
         }
         Err(e) => {
-            log(&format!("{dir}: `git {}` — {e}", args.join(" ")));
+            log(&format!("{}: `git {}` — {e}", sanitize_for_log(dir), args.join(" ")));
             false
         }
     }
@@ -265,6 +307,10 @@ fn has_submodules(dir: &str) -> bool {
 fn has_lfs(dir: &str) -> bool {
     // filter.lfs.clean is set iff git-lfs was ever initialised in this repo
     Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
         .args(["config", "--local", "--get-regexp", "filter\\.lfs\\."])
         .current_dir(dir)
         .stdout(Stdio::null())
@@ -328,7 +374,8 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
     let dir = &repo.path;
     let t = Instant::now();
     log(&format!(
-        "[{n}/{total}] cleaning: {dir}{}",
+        "[{n}/{total}] cleaning: {}{}",
+        sanitize_for_log(dir),
         if repo.is_bare { " (bare)" } else { "" }
     ));
 
@@ -342,7 +389,7 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
         ));
         log(&format!("  (dry-run) git maintenance run --task=loose-objects"));
         if opts.aggressive {
-            log(&format!("  (dry-run) git repack -a -d -f -a -d -f"));
+            log(&format!("  (dry-run) git repack -a -d -f"));
             log(&format!("  (dry-run) git gc --aggressive --prune=all"));
         } else {
             log(&format!(
@@ -389,7 +436,8 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
 
     let ms = t.elapsed().as_millis();
     log(&format!(
-        "[{n}/{total}] {dir}: done in {ms}ms ({})",
+        "[{n}/{total}] {}: done in {ms}ms ({})",
+        sanitize_for_log(dir),
         if ok { "ok" } else { "some errors" }
     ));
     ok
@@ -435,7 +483,7 @@ fn run_cycle(cfg: &Config, dry_run: bool) -> CycleStats {
             let progress = Arc::clone(&progress);
 
             thread::spawn(move || loop {
-                match rx.lock().unwrap().recv() {
+                match rx.lock().unwrap_or_else(|e| e.into_inner()).recv() {
                     Ok(repo) => {
                         let n = progress.fetch_add(1, Ordering::Relaxed) + 1;
                         if !clean_repo(&repo, &opts, dry_run, n, total) {
@@ -452,7 +500,9 @@ fn run_cycle(cfg: &Config, dry_run: bool) -> CycleStats {
         .collect();
 
     for h in handles {
-        h.join().expect("worker panicked");
+        if let Err(_) = h.join() {
+            log("a worker thread panicked; cycle may be incomplete");
+        }
     }
 
     let failed = failed_count.load(Ordering::Relaxed);
@@ -533,7 +583,7 @@ Cleanup pipeline (per repo):
   4. git reflog expire --expire=<REFLOG_EXPIRE> --all
   5. git maintenance run --task=loose-objects
   6. git maintenance run --task=incremental-repack  (normal)
-     git repack -a -d -f -a -d -f        (aggressive)
+     git repack -a -d -f                  (aggressive)
   7. git gc --auto                                   (normal)
      git gc --aggressive --prune=all                (aggressive)
   8. git maintenance run --task=commit-graph
@@ -1219,5 +1269,70 @@ mod tests {
         ]);
         let _ = run_cycle(&cfg, false);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── is_valid_reflog_expire ───────────────────────────────────────────────
+
+    #[test]
+    fn reflog_expire_valid_values_accepted() {
+        for v in ["never", "30.days.ago", "7.days.ago", "1.year.ago", "2024-01-01", "90 days ago"] {
+            assert!(is_valid_reflog_expire(v), "expected valid for {v:?}");
+        }
+    }
+
+    #[test]
+    fn reflog_expire_dangerous_values_rejected() {
+        for v in ["now", "all"] {
+            assert!(!is_valid_reflog_expire(v), "expected invalid for {v:?}");
+        }
+    }
+
+    #[test]
+    fn reflog_expire_invalid_chars_rejected() {
+        assert!(!is_valid_reflog_expire("; rm -rf /"));
+        assert!(!is_valid_reflog_expire("$(whoami)"));
+        assert!(!is_valid_reflog_expire("1970-01-01T00:00:00Z")); // colons not allowed
+    }
+
+    #[test]
+    fn config_reflog_expire_bad_value_falls_back() {
+        let cfg = make_config(&[("MAINTENANCE_REFLOG_EXPIRE", "now")]);
+        assert_eq!(cfg.reflog_expire, DEFAULT_REFLOG_EXPIRE);
+    }
+
+    // ── sanitize_for_log ─────────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_log_str_passes_normal_paths() {
+        assert_eq!(sanitize_for_log("/home/user/repos/project"), "/home/user/repos/project");
+    }
+
+    #[test]
+    fn sanitize_log_str_replaces_newline() {
+        assert_eq!(sanitize_for_log("path\nfake-log-entry"), "path?fake-log-entry");
+    }
+
+    #[test]
+    fn sanitize_log_str_replaces_ansi_escape() {
+        assert_eq!(sanitize_for_log("\x1b[31mred\x1b[0m"), "?[31mred?[0m");
+    }
+
+    #[test]
+    fn sanitize_log_str_replaces_carriage_return() {
+        assert_eq!(sanitize_for_log("path\r\nwindows"), "path??windows");
+    }
+
+    // ── MAX_WORKERS clamp ────────────────────────────────────────────────────
+
+    #[test]
+    fn config_workers_above_max_is_clamped() {
+        let cfg = make_config(&[("MAINTENANCE_WORKERS", "10000")]);
+        assert_eq!(cfg.num_workers, MAX_WORKERS);
+    }
+
+    #[test]
+    fn config_workers_at_max_is_accepted() {
+        let cfg = make_config(&[("MAINTENANCE_WORKERS", &MAX_WORKERS.to_string())]);
+        assert_eq!(cfg.num_workers, MAX_WORKERS);
     }
 }
