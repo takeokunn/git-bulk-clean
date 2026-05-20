@@ -97,6 +97,17 @@ working tree (worktree prune, submodule operations) are skipped for them.
 	Set to _true_ to skip _git lfs prune_ even when the repository has
 	_filter.lfs_ configured. Default: _false_.
 
+*MAINTENANCE_PRUNE_BRANCHES*
+	Set to _true_ to delete local branches that have been merged into the
+	mainline. The mainline is auto-detected from _origin/HEAD_; if that is
+	not set, _main_ is tried, then _master_. Only runs on non-bare
+	repositories. Default: _false_.
+
+*MAINTENANCE_PROTECTED_BRANCHES*
+	Comma-separated list of branch names to never delete, even when
+	_MAINTENANCE_PRUNE_BRANCHES=true_. The detected mainline branch is
+	always protected regardless of this setting. Default: _(empty)_.
+
 # CLEANUP PIPELINE
 
 Each repository is processed through the following phases in order. All
@@ -112,11 +123,18 @@ remaining phases and repositories.
   (skipped for bare repositories).
 . *git reflog expire --expire=<MAINTENANCE_REFLOG_EXPIRE> --all* — expire
   old reflog entries according to the configured cutoff.
+. *git rerere gc* — clean up stale conflict-resolution records from the
+  rerere cache. Always runs; no-op on repositories that do not use rerere.
+. *git notes prune* — remove note refs whose annotated objects no longer
+  exist. Always runs.
+. *git branch -d <merged>* — delete local branches that have been fully
+  merged into the detected mainline branch. Only runs when
+  _MAINTENANCE_PRUNE_BRANCHES=true_ and the repository is not bare.
 . *git maintenance run --task=loose-objects* — consolidate loose objects
   unconditionally (unlike gc --auto this does not check thresholds).
 . *git maintenance run --task=incremental-repack* (normal mode) or
-  *git repack -a -d -f --delta-base-offset* (aggressive mode) — pack
-  objects for efficient storage.
+  *git repack -a -d -f* (aggressive mode) — pack objects for efficient
+  storage.
 . *git gc --auto* (normal mode) or *git gc --aggressive --prune=all*
   (aggressive mode) — run garbage collection.
 . *git maintenance run --task=commit-graph* — write or update the

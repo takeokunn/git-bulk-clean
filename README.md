@@ -56,6 +56,8 @@ $ MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --dry-run
 [git-bulk-clean 14:11:16]   (dry-run) git pack-refs --all
 [git-bulk-clean 14:11:16]   (dry-run) git worktree prune
 [git-bulk-clean 14:11:16]   (dry-run) git reflog expire --expire=30.days.ago --all
+[git-bulk-clean 14:11:16]   (dry-run) git rerere gc
+[git-bulk-clean 14:11:16]   (dry-run) git notes prune
 [git-bulk-clean 14:11:16]   (dry-run) git maintenance run --task=loose-objects
 [git-bulk-clean 14:11:16]   (dry-run) git maintenance run --task=incremental-repack
 [git-bulk-clean 14:11:16]   (dry-run) git gc --auto
@@ -107,7 +109,8 @@ main thread
        │
        └─ clean_repo()
             phase_fetch         git fetch --all --prune --prune-tags
-            phase_refs          pack-refs / worktree prune / reflog expire
+            phase_refs          pack-refs / worktree prune / reflog expire / rerere gc / notes prune
+            phase_branches      branch -d <merged>  (if MAINTENANCE_PRUNE_BRANCHES, non-bare)
             phase_objects       loose-objects / incremental-repack / gc
             phase_indices       commit-graph
             phase_submodules    (if .gitmodules && !bare)
@@ -128,14 +131,17 @@ Each repository runs through these phases in order. All phases are attempted eve
 | 2 | `git pack-refs --all` | always |
 | 3 | `git worktree prune` | always |
 | 4 | `git reflog expire --expire=<REFLOG_EXPIRE> --all` | always |
-| 5 | `git maintenance run --task=loose-objects` | always |
-| 6 | `git maintenance run --task=incremental-repack` | normal mode |
-| 6 | `git repack -a -d -f` | aggressive mode |
-| 7 | `git gc --auto` | normal mode |
-| 7 | `git gc --aggressive --prune=all` | aggressive mode |
-| 8 | `git maintenance run --task=commit-graph` | always |
-| 9 | `git submodule sync --recursive` + `foreach git gc --auto` | `.gitmodules` exists, non-bare |
-| 10 | `git lfs prune` | `filter.lfs` configured in repo |
+| 5 | `git rerere gc` | always |
+| 6 | `git notes prune` | always |
+| 7 | `git branch -d <merged>` | `MAINTENANCE_PRUNE_BRANCHES=true`, non-bare |
+| 8 | `git maintenance run --task=loose-objects` | always |
+| 9 | `git maintenance run --task=incremental-repack` | normal mode |
+| 9 | `git repack -a -d -f` | aggressive mode |
+| 10 | `git gc --auto` | normal mode |
+| 10 | `git gc --aggressive --prune=all` | aggressive mode |
+| 11 | `git maintenance run --task=commit-graph` | always |
+| 12 | `git submodule sync --recursive` + `foreach git gc --auto` | `.gitmodules` exists, non-bare |
+| 13 | `git lfs prune` | `filter.lfs` configured in repo |
 
 > **Why run `loose-objects` and `incremental-repack` before `gc`?**  
 > `git gc --auto` only triggers when internal thresholds are exceeded.  
@@ -315,6 +321,8 @@ All configuration is via environment variables — no config file required.
 | `MAINTENANCE_WORKERS` | `5` | Parallel worker threads (0 falls back to default) |
 | `MAINTENANCE_SKIP_SUBMODULES` | `false` | `true` → skip submodule sync/gc even if `.gitmodules` exists |
 | `MAINTENANCE_SKIP_LFS` | `false` | `true` → skip `git lfs prune` even if LFS is configured |
+| `MAINTENANCE_PRUNE_BRANCHES` | `false` | `true` → delete local branches merged into the mainline (non-bare only) |
+| `MAINTENANCE_PROTECTED_BRANCHES` | _(empty)_ | Comma-separated branch names to never delete (mainline is always protected) |
 
 Paths listed in `MAINTENANCE_REPOS` that do not exist or are not git repositories are silently ignored.
 
