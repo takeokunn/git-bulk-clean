@@ -414,7 +414,7 @@ fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
                 log(&format!(
                     "{}: `git branch --merged {}` — {}",
                     sanitize_for_log(dir),
-                    mainline,
+                    sanitize_for_log(&mainline),
                     sanitize_for_log(msg)
                 ));
             }
@@ -424,7 +424,7 @@ fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
             log(&format!(
                 "{}: `git branch --merged {}` — {e}",
                 sanitize_for_log(dir),
-                mainline
+                sanitize_for_log(&mainline)
             ));
             return false;
         }
@@ -432,13 +432,20 @@ fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
     let candidates: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(|l| l.trim_start_matches('*').trim().to_string())
-        .filter(|b| !b.is_empty() && b != &mainline && !protected_branches.contains(b))
+        .filter(|b| {
+            !b.is_empty()
+                && !b.starts_with('(') // skip "(HEAD detached at ...)"
+                && b != &mainline
+                && !protected_branches.contains(b)
+        })
         .collect();
-    let mut ok = true;
-    for branch in &candidates {
-        ok &= git(dir, &["branch", "-d", branch]);
+    if candidates.is_empty() {
+        true
+    } else {
+        let mut args = vec!["branch", "-d"];
+        args.extend(candidates.iter().map(|s| s.as_str()));
+        git(dir, &args)
     }
-    ok
 }
 
 fn phase_objects_normal(dir: &str) -> bool {
@@ -495,7 +502,8 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
         log(&format!("  (dry-run) git rerere gc"));
         log(&format!("  (dry-run) git notes prune"));
         if !repo.is_bare && opts.prune_branches {
-            log(&format!("  (dry-run) git branch --merged <mainline> | git branch -d (merged branches)"));
+            let mainline = detect_mainline(dir);
+            log(&format!("  (dry-run) git branch --merged {} | git branch -d (merged branches)", sanitize_for_log(&mainline)));
         }
         log(&format!("  (dry-run) git maintenance run --task=loose-objects"));
         if opts.aggressive {
@@ -866,6 +874,8 @@ mod tests {
             ("MAINTENANCE_WORKERS", "8"),
             ("MAINTENANCE_SKIP_SUBMODULES", "true"),
             ("MAINTENANCE_SKIP_LFS", "true"),
+            ("MAINTENANCE_PRUNE_BRANCHES", "true"),
+            ("MAINTENANCE_PROTECTED_BRANCHES", "main,release"),
         ]);
         assert_eq!(cfg.repos, ["/a", "/b", "/c"]);
         assert!(cfg.ghq_enable);
@@ -875,6 +885,8 @@ mod tests {
         assert_eq!(cfg.num_workers, 8);
         assert!(cfg.skip_submodules);
         assert!(cfg.skip_lfs);
+        assert!(cfg.prune_branches);
+        assert_eq!(cfg.protected_branches, ["main", "release"]);
     }
 
     #[test]
@@ -1026,7 +1038,10 @@ mod tests {
     }
 
     fn make_temp_git_repo(name: &str) -> std::path::PathBuf {
-        let tmp = env::temp_dir().join(format!("git_bulk_clean_{name}"));
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = env::temp_dir().join(format!("git_bulk_clean_{}_{}", name, id));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         Command::new("git").args(["init"]).current_dir(&tmp).output().unwrap();
@@ -1104,12 +1119,16 @@ mod tests {
             ("MAINTENANCE_AGGRESSIVE", "true"),
             ("MAINTENANCE_SKIP_SUBMODULES", "true"),
             ("MAINTENANCE_SKIP_LFS", "true"),
+            ("MAINTENANCE_PRUNE_BRANCHES", "true"),
+            ("MAINTENANCE_PROTECTED_BRANCHES", "main,develop"),
         ]);
         let opts = CleanOptions::from_config(&cfg);
         assert_eq!(opts.reflog_expire, "90.days.ago");
         assert!(opts.aggressive);
         assert!(opts.skip_submodules);
         assert!(opts.skip_lfs);
+        assert!(opts.prune_branches);
+        assert_eq!(opts.protected_branches, ["main", "develop"]);
     }
 
     #[test]
@@ -1367,6 +1386,18 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn clean_repo_live_with_prune_branches_does_not_panic() {
+        let tmp = make_temp_git_repo("clean_repo_prune");
+        let repo = RepoInfo { path: tmp.to_str().unwrap().to_string(), is_bare: false };
+        let opts = CleanOptions::from_config(&make_config(&[
+            ("MAINTENANCE_PRUNE_BRANCHES", "true"),
+            ("MAINTENANCE_SKIP_LFS", "true"),
+        ]));
+        let _ = clean_repo(&repo, &opts, false, 1, 1);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     // ── run_cycle ────────────────────────────────────────────────────────────
 
     #[test]
@@ -1500,20 +1531,39 @@ mod tests {
 
     #[test]
     fn detect_mainline_falls_back_to_master_when_no_main() {
-        // A fresh repo initialized without -b has "master" as default
-        let tmp = make_temp_git_repo("detect_mainline_master");
-        // Confirm "main" does not exist in this repo
-        let has_main = Command::new("git")
-            .args(["rev-parse", "--verify", "main"])
-            .current_dir(&tmp)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !has_main {
-            assert_eq!(detect_mainline(tmp.to_str().unwrap()), "master");
-        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = env::temp_dir().join(format!("git_bulk_clean_mainline_master_{}", id));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // Force "master" so this test is unconditional regardless of init.defaultBranch
+        Command::new("git").args(["init", "-b", "master"]).current_dir(&tmp).output().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t.com"]).current_dir(&tmp).output().unwrap();
+        Command::new("git").args(["config", "user.name", "T"]).current_dir(&tmp).output().unwrap();
+        fs::write(tmp.join("f"), "x").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&tmp).output().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(&tmp).output().unwrap();
+        assert_eq!(detect_mainline(tmp.to_str().unwrap()), "master");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detect_mainline_falls_back_to_main_when_main_exists() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = env::temp_dir().join(format!("git_bulk_clean_mainline_main_{}", id));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // Force "main" so there is no origin/HEAD but "main" exists locally
+        Command::new("git").args(["init", "-b", "main"]).current_dir(&tmp).output().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t.com"]).current_dir(&tmp).output().unwrap();
+        Command::new("git").args(["config", "user.name", "T"]).current_dir(&tmp).output().unwrap();
+        fs::write(tmp.join("f"), "x").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&tmp).output().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(&tmp).output().unwrap();
+        assert_eq!(detect_mainline(tmp.to_str().unwrap()), "main");
         let _ = fs::remove_dir_all(&tmp);
     }
 
