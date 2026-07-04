@@ -330,7 +330,12 @@ Paths listed in `MAINTENANCE_REPOS` that do not exist or are not git repositorie
 
 ## Home Manager integration
 
-`git-bulk-clean` ships a [Home Manager](https://github.com/nix-community/home-manager) module that registers a `systemd` user service running the daemon at **idle CPU and I/O priority** (`Nice=19`, `IOSchedulingClass=idle`) so it never competes with your active work.
+`git-bulk-clean` ships a [Home Manager](https://github.com/nix-community/home-manager) module that runs maintenance at **background priority** so it never competes with your active work. It is cross-platform:
+
+- **Linux** — a `systemd` user service running the daemon at idle CPU and I/O priority (`Nice=19`, `IOSchedulingClass=idle`).
+- **macOS** — a `launchd` agent that runs one cleanup pass on each `StartInterval` at background priority (`ProcessType=Background`, `LowPriorityIO`, `Nice=19`), logging to `~/Library/Logs/git-maintenance.log`.
+
+The same options drive both backends.
 
 ```nix
 # flake.nix
