@@ -6,8 +6,7 @@ git-bulk-clean - parallel Git repository maintenance CLI/daemon
 
 # SYNOPSIS
 
-*git-bulk-clean* [--daemon] [--dry-run] [--list] [--version] [--help]
-               [--generate-completions bash|zsh|fish]
+*git-bulk-clean* [--daemon] [--dry-run] [--list] [--version] [--help] [--generate-completions bash|zsh|fish]
 
 # DESCRIPTION
 
@@ -115,37 +114,19 @@ phases are attempted even if an earlier one fails — errors are logged and
 the repository is counted as failed, but processing continues with the
 remaining phases and repositories.
 
-. *git fetch --all --prune --prune-tags* — fetch from all remotes, remove
-  stale remote-tracking branches and tags.
-. *git pack-refs --all* — pack loose reference files into a single
-  packed-refs file.
-. *git worktree prune* — remove stale worktree administrative files
-  (skipped for bare repositories).
-. *git reflog expire --expire=<MAINTENANCE_REFLOG_EXPIRE> --all* — expire
-  old reflog entries according to the configured cutoff.
-. *git rerere gc* — clean up stale conflict-resolution records from the
-  rerere cache. Always runs; no-op on repositories that do not use rerere.
-. *git notes prune* — remove note refs whose annotated objects no longer
-  exist. Always runs.
-. *git branch -d <merged>* — delete local branches that have been fully
-  merged into the detected mainline branch. Only runs when
-  _MAINTENANCE_PRUNE_BRANCHES=true_ and the repository is not bare.
-. *git maintenance run --task=loose-objects* — consolidate loose objects
-  unconditionally (unlike gc --auto this does not check thresholds).
-. *git maintenance run --task=incremental-repack* (normal mode) or
-  *git repack -a -d -f* (aggressive mode) — pack objects for efficient
-  storage.
-. *git gc --auto* (normal mode) or *git gc --aggressive --prune=all*
-  (aggressive mode) — run garbage collection.
-. *git maintenance run --task=commit-graph* — write or update the
-  commit-graph file for faster graph traversal.
-. *git submodule sync --recursive* and *git submodule foreach git gc
-  --auto* — synchronise submodule URLs and compact their object stores.
-  Skipped when _.gitmodules_ is absent, the repository is bare, or
-  _MAINTENANCE_SKIP_SUBMODULES=true_.
-. *git lfs prune* — remove locally cached LFS objects that are no longer
-  referenced. Skipped when _filter.lfs_ is not configured in the
-  repository or _MAINTENANCE_SKIP_LFS=true_.
+. *git fetch --all --prune --prune-tags* — fetch from all remotes, removing stale remote-tracking branches and tags.
+. *git pack-refs --all* — pack loose reference files into a single packed-refs file.
+. *git worktree prune* — remove stale worktree administrative files (skipped for bare repositories).
+. *git reflog expire --expire=<MAINTENANCE_REFLOG_EXPIRE> --all* — expire old reflog entries according to the configured cutoff.
+. *git rerere gc* — clean up stale conflict-resolution records from the rerere cache. Always runs; no-op on repositories that do not use rerere.
+. *git notes prune* — remove note refs whose annotated objects no longer exist. Always runs.
+. *git branch -d <merged>* — delete local branches fully merged into the detected mainline. Only runs when _MAINTENANCE_PRUNE_BRANCHES=true_ and the repository is not bare.
+. *git maintenance run --task=loose-objects* — consolidate loose objects unconditionally (unlike gc --auto, this does not check thresholds).
+. *git maintenance run --task=incremental-repack* (normal) or *git repack -a -d -f* (aggressive) — pack objects for efficient storage.
+. *git gc --auto* (normal) or *git gc --aggressive --prune=all* (aggressive) — run garbage collection.
+. *git maintenance run --task=commit-graph* — write or update the commit-graph file for faster graph traversal.
+. *git submodule sync --recursive* and *git submodule foreach git gc --auto* — synchronise submodule URLs and compact their object stores. Skipped when _.gitmodules_ is absent, the repository is bare, or _MAINTENANCE_SKIP_SUBMODULES=true_.
+. *git lfs prune* — remove locally cached LFS objects that are no longer referenced. Skipped when _filter.lfs_ is not configured or _MAINTENANCE_SKIP_LFS=true_.
 
 # EXIT STATUS
 
