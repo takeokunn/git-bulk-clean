@@ -386,6 +386,11 @@ systemctl --user journal -f git-maintenance
 | `interval` | `int` | `86400` | Cycle interval in seconds |
 | `reflogExpire` | `str` | `"30.days.ago"` | Reflog expiry cutoff |
 | `aggressive` | `bool` | `false` | Use aggressive GC mode |
+| `workers` | `int` | `5` | Parallel worker threads |
+| `skipSubmodules` | `bool` | `false` | Skip submodule sync/gc |
+| `skipLfs` | `bool` | `false` | Skip `git lfs prune` |
+| `pruneBranches` | `bool` | `false` | Delete merged local branches |
+| `protectedBranches` | `[str]` | `[]` | Branches to never delete |
 
 ---
 
@@ -426,9 +431,11 @@ git-bulk-clean/
 ├── Cargo.lock
 ├── flake.nix         # Nix package, dev shell, app, homeManagerModules
 ├── hm-module.nix     # Home Manager module (systemd user service)
+├── man/
+│   └── git-bulk-clean.1.scd  # scdoc man page (built by the Nix package)
 └── .github/
     ├── workflows/
-    │   ├── ci.yml    # actionlint + nix flake check + nix build + cargo test
+    │   ├── ci.yml    # actionlint + flake check + fmt + clippy + build + test
     │   └── main.yml  # triggers on push to main
     └── dependabot.yml
 ```
