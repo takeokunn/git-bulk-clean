@@ -181,6 +181,7 @@ struct Config {
     num_workers: NonZeroUsize,
     skip_submodules: bool,
     skip_lfs: bool,
+    prune_tags: bool,
     prune_branches: bool,
     protected_branches: Vec<String>,
 }
@@ -218,9 +219,11 @@ impl Config {
                 }
             },
             aggressive: bool_var(&get, "MAINTENANCE_AGGRESSIVE", false),
+            // 0 would make the daemon loop without sleeping; treat it as invalid
             interval_secs: get("MAINTENANCE_INTERVAL")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
+                .filter(|&v| v > 0)
                 .unwrap_or(DEFAULT_INTERVAL_SECS),
             num_workers: get("MAINTENANCE_WORKERS")
                 .ok()
@@ -229,6 +232,7 @@ impl Config {
                 .unwrap_or(DEFAULT_WORKERS),
             skip_submodules: bool_var(&get, "MAINTENANCE_SKIP_SUBMODULES", false),
             skip_lfs: bool_var(&get, "MAINTENANCE_SKIP_LFS", false),
+            prune_tags: bool_var(&get, "MAINTENANCE_PRUNE_TAGS", false),
             prune_branches: bool_var(&get, "MAINTENANCE_PRUNE_BRANCHES", false),
             protected_branches: get("MAINTENANCE_PROTECTED_BRANCHES")
                 .unwrap_or_default()
@@ -251,12 +255,12 @@ where
 
 fn is_valid_reflog_expire(v: &str) -> bool {
     let v = v.trim();
-    // "never" safely disables expiry
-    if v == "never" {
+    // "never" safely disables expiry (git parses these case-insensitively)
+    if v.eq_ignore_ascii_case("never") {
         return true;
     }
     // "now" and "all" expire everything immediately — dangerous
-    if matches!(v, "now" | "all") {
+    if v.eq_ignore_ascii_case("now") || v.eq_ignore_ascii_case("all") {
         return false;
     }
     // Allow alphanumeric, '.', '-', space: covers "30.days.ago", "YYYY-MM-DD", "90 days ago"
@@ -270,6 +274,7 @@ struct CleanOptions {
     aggressive: bool,
     skip_submodules: bool,
     skip_lfs: bool,
+    prune_tags: bool,
     prune_branches: bool,
     protected_branches: Vec<String>,
 }
@@ -281,6 +286,7 @@ impl CleanOptions {
             aggressive: cfg.aggressive,
             skip_submodules: cfg.skip_submodules,
             skip_lfs: cfg.skip_lfs,
+            prune_tags: cfg.prune_tags,
             prune_branches: cfg.prune_branches,
             protected_branches: cfg.protected_branches.clone(),
         }
@@ -336,34 +342,58 @@ fn ghq_repos() -> Vec<String> {
         })
 }
 
-// Returns None if `dir` is not a git repository. A single git call covers both
-// the validity check and the bare/normal distinction.
-fn detect_repo_kind(dir: &str) -> Option<RepoKind> {
+// Returns None if `dir` is not a git repository. A single git call covers the
+// validity check, the bare/normal distinction, and the canonical git dir used
+// to deduplicate repos reached via different spellings (trailing slash,
+// symlink, subdirectory of a working tree).
+fn probe_repo(dir: &str) -> Option<(RepoKind, String)> {
     Command::new("git")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
-        .args(["rev-parse", "--is-bare-repository"])
+        .args(["rev-parse", "--is-bare-repository", "--absolute-git-dir"])
         .current_dir(dir)
         .output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| RepoKind::from_is_bare(s.trim() == "true"))
+        .and_then(|s| {
+            // Output lines follow argument order: is-bare flag, then git dir
+            let mut lines = s.lines();
+            let is_bare = lines.next()?.trim() == "true";
+            let git_dir = lines.next()?.trim().to_string();
+            Some((RepoKind::from_is_bare(is_bare), git_dir))
+        })
 }
 
 fn collect_repos(cfg: &Config) -> Vec<RepoInfo> {
-    let mut seen: HashSet<String> = cfg.repos.iter().cloned().collect();
-    if cfg.ghq_enable {
-        seen.extend(ghq_repos());
+    let mut candidates: Vec<String> = {
+        let mut seen: HashSet<String> = cfg.repos.iter().cloned().collect();
+        if cfg.ghq_enable {
+            seen.extend(ghq_repos());
+        }
+        seen.into_iter().collect()
+    };
+    // Sort before deduplication so which spelling of a duplicate survives is
+    // deterministic, and the final list stays ordered by path.
+    candidates.sort();
+
+    let mut seen_git_dirs: HashSet<String> = HashSet::new();
+    let mut repos: Vec<RepoInfo> = Vec::new();
+    for path in candidates {
+        if !Path::new(&path).is_dir() {
+            continue;
+        }
+        let Some((kind, git_dir)) = probe_repo(&path) else {
+            continue;
+        };
+        // Two workers running gc on the same repo concurrently fight over
+        // git's locks, so drop paths that resolve to an already-seen git dir.
+        if seen_git_dirs.insert(git_dir) {
+            repos.push(RepoInfo { path, kind });
+        }
     }
-    let mut repos: Vec<RepoInfo> = seen
-        .into_iter()
-        .filter(|p| Path::new(p).is_dir())
-        .filter_map(|p| detect_repo_kind(&p).map(|kind| RepoInfo { path: p, kind }))
-        .collect();
-    repos.sort_by(|a, b| a.path.cmp(&b.path));
     repos
 }
 
@@ -434,9 +464,14 @@ fn has_lfs(dir: &str) -> bool {
 
 // ── cleanup phases ────────────────────────────────────────────────────────────
 
-fn phase_fetch(dir: &str) -> bool {
-    // --prune-tags also removes tags deleted on the remote (--prune covers branches)
-    git(dir, &["fetch", "--all", "--prune", "--prune-tags"])
+fn phase_fetch(dir: &str, prune_tags: bool) -> bool {
+    // --prune-tags removes local tags absent from the remote — including tags
+    // the user created and never pushed — so it stays opt-in.
+    if prune_tags {
+        git(dir, &["fetch", "--all", "--prune", "--prune-tags"])
+    } else {
+        git(dir, &["fetch", "--all", "--prune"])
+    }
 }
 
 fn phase_refs(dir: &str, reflog_expire: &str) -> bool {
@@ -456,7 +491,30 @@ fn phase_refs(dir: &str, reflog_expire: &str) -> bool {
     ok & git(dir, &["notes", "prune"])
 }
 
-fn detect_mainline(dir: &str) -> String {
+fn local_branch_exists(dir: &str, name: &str) -> bool {
+    // Fully qualified so a tag with the same name cannot shadow the branch
+    Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{name}"),
+        ])
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// Returns None when no mainline can be determined; branch pruning is skipped
+// then instead of failing every cycle against a nonexistent branch.
+fn detect_mainline(dir: &str) -> Option<String> {
     // Try origin's default branch via symbolic-ref (e.g. "origin/main" → "main")
     let out = Command::new("git")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -472,34 +530,31 @@ fn detect_mainline(dir: &str) -> String {
         if o.status.success() {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
             // "origin/main" → "main"
-            if let Some(branch) = s.split_once('/').map(|(_, b)| b.to_string()) {
-                return branch;
+            let branch = match s.split_once('/') {
+                Some((_, b)) => b.to_string(),
+                None => s,
+            };
+            // A name starting with '-' would be parsed as a flag downstream
+            if !branch.is_empty() && !branch.starts_with('-') {
+                return Some(branch);
             }
-            return s;
         }
     }
-    // Fallback: prefer "main" if it exists locally, otherwise "master"
-    let main_exists = Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
-        .args(["rev-parse", "--verify", "main"])
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if main_exists {
-        "main".to_string()
-    } else {
-        "master".to_string()
-    }
+    // Fallback: "main", then "master" — but only if the branch actually exists
+    ["main", "master"]
+        .into_iter()
+        .find(|name| local_branch_exists(dir, name))
+        .map(str::to_string)
 }
 
 fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
-    let mainline = detect_mainline(dir);
+    let Some(mainline) = detect_mainline(dir) else {
+        log(&format!(
+            "{}: no mainline branch found; skipping branch pruning",
+            sanitize_for_log(dir)
+        ));
+        return true;
+    };
     let out = Command::new("git")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_COUNT", "3")
@@ -540,10 +595,14 @@ fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
     };
     let candidates: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
-        .map(|l| l.trim_start_matches('*').trim().to_string())
+        // '*' marks the checked-out branch and '+' one checked out in another
+        // worktree — git refuses to delete either, so skip both up front
+        .filter(|l| !l.starts_with('*') && !l.starts_with('+'))
+        .map(|l| l.trim().to_string())
         .filter(|b| {
             !b.is_empty()
                 && !b.starts_with('(') // skip "(HEAD detached at ...)"
+                && !b.starts_with('-') // never let a ref name be parsed as a flag
                 && b != &mainline
                 && !protected_branches.contains(b)
         })
@@ -551,7 +610,8 @@ fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
     if candidates.is_empty() {
         true
     } else {
-        let mut args = vec!["branch", "-d"];
+        // "--" so no branch name can ever be interpreted as an option
+        let mut args = vec!["branch", "-d", "--"];
         args.extend(candidates.iter().map(|s| s.as_str()));
         git(dir, &args)
     }
@@ -601,7 +661,11 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
     ));
 
     if dry_run {
-        log("  (dry-run) git fetch --all --prune --prune-tags");
+        if opts.prune_tags {
+            log("  (dry-run) git fetch --all --prune --prune-tags");
+        } else {
+            log("  (dry-run) git fetch --all --prune");
+        }
         log("  (dry-run) git pack-refs --all");
         log("  (dry-run) git worktree prune");
         log(&format!(
@@ -611,11 +675,13 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
         log("  (dry-run) git rerere gc");
         log("  (dry-run) git notes prune");
         if !repo.kind.is_bare() && opts.prune_branches {
-            let mainline = detect_mainline(dir);
-            log(&format!(
-                "  (dry-run) git branch --merged {} | git branch -d (merged branches)",
-                sanitize_for_log(&mainline)
-            ));
+            match detect_mainline(dir) {
+                Some(mainline) => log(&format!(
+                    "  (dry-run) git branch --merged {} | git branch -d -- (merged branches)",
+                    sanitize_for_log(&mainline)
+                )),
+                None => log("  (dry-run) branch pruning skipped: no mainline branch found"),
+            }
         }
         log("  (dry-run) git maintenance run --task=loose-objects");
         if opts.aggressive {
@@ -636,7 +702,7 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
         return true;
     }
 
-    let ok = phase_fetch(dir)
+    let ok = phase_fetch(dir, opts.prune_tags)
         & phase_refs(dir, &opts.reflog_expire)
         & if !repo.kind.is_bare() && opts.prune_branches {
             phase_branches(dir, &opts.protected_branches)
@@ -757,6 +823,18 @@ enum CliAction {
 }
 
 fn parse_args(flags: &[String]) -> Result<CliAction, String> {
+    // Reject unknown options first so a typo (e.g. "--deamon") cannot silently
+    // fall through to a one-shot live run.
+    let mut iter = flags.iter();
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "-h" | "--help" | "-V" | "--version" | "--list" | "--daemon" | "--dry-run" => {}
+            "--generate-completions" => {
+                iter.next(); // shell name validated below
+            }
+            other => return Err(format!("unknown option {other:?} (see --help)")),
+        }
+    }
     if flags.iter().any(|a| a == "-h" || a == "--help") {
         return Ok(CliAction::Help);
     }
@@ -801,17 +879,18 @@ Environment variables:
   MAINTENANCE_WORKERS            Parallel workers (default: {DEFAULT_WORKERS})
   MAINTENANCE_SKIP_SUBMODULES    true → skip submodule cleanup
   MAINTENANCE_SKIP_LFS           true → skip git-lfs prune
+  MAINTENANCE_PRUNE_TAGS         true → also delete local tags missing from the remote (fetch --prune-tags)
   MAINTENANCE_PRUNE_BRANCHES     true → delete merged local branches (non-bare only)
   MAINTENANCE_PROTECTED_BRANCHES Comma-separated branch names to protect from deletion
 
 Cleanup pipeline (per repo):
-  1. git fetch --all --prune --prune-tags
+  1. git fetch --all --prune                         (--prune-tags if MAINTENANCE_PRUNE_TAGS)
   2. git pack-refs --all
   3. git worktree prune
   4. git reflog expire --expire=<REFLOG_EXPIRE> --all
   5. git rerere gc
   6. git notes prune
-  7. git branch -d <merged>                          (if MAINTENANCE_PRUNE_BRANCHES, non-bare)
+  7. git branch -d -- <merged>                       (if MAINTENANCE_PRUNE_BRANCHES, non-bare)
   8. git maintenance run --task=loose-objects
   9. git maintenance run --task=incremental-repack  (normal)
      git repack -a -d -f                  (aggressive)
@@ -824,8 +903,10 @@ Cleanup pipeline (per repo):
     )
 }
 
+// Explicitly requested help/version go to stdout so they can be piped;
+// errors and logs stay on stderr.
 fn print_help(prog: &str) {
-    eprint!("{}", help_text(prog));
+    print!("{}", help_text(prog));
 }
 
 fn main() {
@@ -838,7 +919,7 @@ fn main() {
             print_help(prog);
         }
         Ok(CliAction::Version) => {
-            eprintln!("git-bulk-clean {VERSION}");
+            println!("git-bulk-clean {VERSION}");
         }
         Ok(CliAction::GenerateCompletions(shell)) => {
             print!("{}", shell.completion_script());
@@ -999,6 +1080,26 @@ mod tests {
     }
 
     #[test]
+    fn config_interval_zero_falls_back() {
+        // 0 would turn the daemon loop into a busy loop
+        let cfg = make_config(&[("MAINTENANCE_INTERVAL", "0")]);
+        assert_eq!(cfg.interval_secs, DEFAULT_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn config_prune_tags_defaults_false() {
+        // fetch --prune-tags deletes unpushed local tags, so it must be opt-in
+        let cfg = make_config(&[]);
+        assert!(!cfg.prune_tags);
+    }
+
+    #[test]
+    fn config_prune_tags_enabled() {
+        let cfg = make_config(&[("MAINTENANCE_PRUNE_TAGS", "true")]);
+        assert!(cfg.prune_tags);
+    }
+
+    #[test]
     fn config_workers_zero_falls_back() {
         let cfg = make_config(&[("MAINTENANCE_WORKERS", "0")]);
         assert_eq!(cfg.num_workers, DEFAULT_WORKERS);
@@ -1034,22 +1135,40 @@ mod tests {
     }
 
     #[test]
-    fn detect_repo_kind_project_is_non_bare() {
+    fn probe_repo_project_is_non_bare() {
         let tmp = make_temp_git_repo("detect_kind_nonbare");
-        let kind = detect_repo_kind(tmp.to_str().unwrap());
-        assert_eq!(kind, Some(RepoKind::Normal));
+        let (kind, git_dir) = probe_repo(tmp.to_str().unwrap()).expect("should be a repo");
+        assert_eq!(kind, RepoKind::Normal);
+        assert!(
+            git_dir.ends_with(".git"),
+            "expected absolute git dir, got {git_dir:?}"
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn detect_repo_kind_non_repo_returns_none() {
+    fn probe_repo_non_repo_returns_none() {
         // Create a temp dir that is not a git repo
         let tmp = env::temp_dir().join("git_bulk_clean_nonrepo_test");
         let _ = fs::create_dir_all(&tmp);
-        let kind = detect_repo_kind(tmp.to_str().unwrap());
+        let kind = probe_repo(tmp.to_str().unwrap());
         assert!(
             kind.is_none(),
             "plain directory should not be detected as a repo"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collect_deduplicates_same_repo_via_trailing_slash() {
+        let tmp = make_temp_git_repo("collect_dedup_slash");
+        let repo_path = tmp.to_str().unwrap().to_string();
+        let cfg = make_config(&[("MAINTENANCE_REPOS", &format!("{repo_path},{repo_path}/"))]);
+        let repos = collect_repos(&cfg);
+        assert_eq!(
+            repos.len(),
+            1,
+            "same repo via different spellings must be cleaned once"
         );
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1367,6 +1486,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_unknown_flag_is_an_error() {
+        for bad in ["--deamon", "--force", "-x", "--dry_run"] {
+            let err = parse_args(&strs(&[bad])).unwrap_err();
+            assert!(err.contains(bad), "error should name the unknown flag");
+        }
+    }
+
+    #[test]
+    fn parse_args_unknown_flag_rejected_even_with_valid_flags() {
+        assert!(parse_args(&strs(&["--daemon", "--oops"])).is_err());
+    }
+
+    #[test]
     fn parse_args_daemon_and_dry_run() {
         assert!(matches!(
             parse_args(&strs(&["--daemon", "--dry-run"])),
@@ -1401,6 +1533,7 @@ mod tests {
             "MAINTENANCE_WORKERS",
             "MAINTENANCE_SKIP_SUBMODULES",
             "MAINTENANCE_SKIP_LFS",
+            "MAINTENANCE_PRUNE_TAGS",
             "MAINTENANCE_PRUNE_BRANCHES",
             "MAINTENANCE_PROTECTED_BRANCHES",
         ] {
@@ -1449,7 +1582,8 @@ mod tests {
     #[test]
     fn phase_fetch_on_repo_without_remotes_does_not_panic() {
         let tmp = make_temp_git_repo("phase_fetch");
-        let _ = phase_fetch(tmp.to_str().unwrap());
+        let _ = phase_fetch(tmp.to_str().unwrap(), false);
+        let _ = phase_fetch(tmp.to_str().unwrap(), true);
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1599,8 +1733,16 @@ mod tests {
 
     #[test]
     fn reflog_expire_dangerous_values_rejected() {
-        for v in ["now", "all"] {
+        // git parses these case-insensitively, so the guard must too
+        for v in ["now", "all", "NOW", "All", " now "] {
             assert!(!is_valid_reflog_expire(v), "expected invalid for {v:?}");
+        }
+    }
+
+    #[test]
+    fn reflog_expire_never_accepted_case_insensitively() {
+        for v in ["never", "NEVER", "Never"] {
+            assert!(is_valid_reflog_expire(v), "expected valid for {v:?}");
         }
     }
 
@@ -1734,7 +1876,29 @@ mod tests {
             .current_dir(&tmp)
             .output()
             .unwrap();
-        assert_eq!(detect_mainline(tmp.to_str().unwrap()), "master");
+        assert_eq!(
+            detect_mainline(tmp.to_str().unwrap()),
+            Some("master".to_string())
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detect_mainline_none_when_no_main_or_master() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = env::temp_dir().join(format!("git_bulk_clean_mainline_none_{}", id));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        Command::new("git")
+            .args(["init", "-b", "trunk"])
+            .current_dir(&tmp)
+            .output()
+            .unwrap();
+        assert_eq!(detect_mainline(tmp.to_str().unwrap()), None);
+        // With no mainline, branch pruning must be skipped, not failed
+        assert!(phase_branches(tmp.to_str().unwrap(), &[]));
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1773,7 +1937,10 @@ mod tests {
             .current_dir(&tmp)
             .output()
             .unwrap();
-        assert_eq!(detect_mainline(tmp.to_str().unwrap()), "main");
+        assert_eq!(
+            detect_mainline(tmp.to_str().unwrap()),
+            Some("main".to_string())
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1792,7 +1959,7 @@ mod tests {
         let tmp = make_temp_git_repo("phase_branches_delete");
         let dir = tmp.to_str().unwrap();
         // Detect the default branch name
-        let mainline = detect_mainline(dir);
+        let mainline = detect_mainline(dir).unwrap();
         // Create a feature branch, commit, merge back, then run phase_branches
         Command::new("git")
             .args(["checkout", "-b", "feature/x"])
@@ -1841,7 +2008,7 @@ mod tests {
     fn phase_branches_skips_protected_branch() {
         let tmp = make_temp_git_repo("phase_branches_protected");
         let dir = tmp.to_str().unwrap();
-        let mainline = detect_mainline(dir);
+        let mainline = detect_mainline(dir).unwrap();
         // Create a feature branch and merge it
         Command::new("git")
             .args(["checkout", "-b", "protected-branch"])
@@ -1882,6 +2049,85 @@ mod tests {
         assert!(
             branch_list.contains("protected-branch"),
             "protected branch should not have been deleted"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_branches_never_passes_flag_like_names() {
+        // A ref literally named "-D" can be created via update-ref (bypassing
+        // git branch's name validation). It must never reach `git branch -d`
+        // as an argument, where it would be parsed as the force-delete flag.
+        let tmp = make_temp_git_repo("phase_branches_flag_name");
+        let dir = tmp.to_str().unwrap();
+        Command::new("git")
+            .args(["update-ref", "refs/heads/-D", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(phase_branches(dir, &[]));
+        let branches = Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/heads/"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let refs = String::from_utf8_lossy(&branches.stdout);
+        assert!(
+            refs.contains("refs/heads/-D"),
+            "flag-like branch must be skipped, not deleted or misparsed"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_branches_skips_currently_checked_out_branch() {
+        // HEAD on a merged feature branch: git cannot delete it, so it must
+        // be filtered out and the phase must still succeed.
+        let tmp = make_temp_git_repo("phase_branches_checked_out");
+        let dir = tmp.to_str().unwrap();
+        let mainline = detect_mainline(dir).unwrap();
+        Command::new("git")
+            .args(["checkout", "-b", "feature/current"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        fs::write(tmp.join("c.txt"), "c").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "c"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["checkout", &mainline])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["merge", "feature/current", "--no-ff", "-m", "merge"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        // Go back to the (now merged) feature branch before pruning
+        Command::new("git")
+            .args(["checkout", "feature/current"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(phase_branches(dir, &[]));
+        let branches = Command::new("git")
+            .args(["branch"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let branch_list = String::from_utf8_lossy(&branches.stdout);
+        assert!(
+            branch_list.contains("feature/current"),
+            "checked-out branch must survive pruning"
         );
         let _ = fs::remove_dir_all(&tmp);
     }

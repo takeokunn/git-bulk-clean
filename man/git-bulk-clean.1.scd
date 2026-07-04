@@ -81,7 +81,8 @@ working tree (worktree prune, submodule operations) are skipped for them.
 
 *MAINTENANCE_INTERVAL*
 	Number of seconds git-bulk-clean sleeps between cleanup cycles when
-	running in daemon mode (--daemon). Default: _86400_ (24 hours).
+	running in daemon mode (--daemon). Zero or invalid values fall back to
+	the default. Default: _86400_ (24 hours).
 
 *MAINTENANCE_WORKERS*
 	Number of parallel worker threads used to process repositories
@@ -96,11 +97,18 @@ working tree (worktree prune, submodule operations) are skipped for them.
 	Set to _true_ to skip _git lfs prune_ even when the repository has
 	_filter.lfs_ configured. Default: _false_.
 
+*MAINTENANCE_PRUNE_TAGS*
+	Set to _true_ to pass _--prune-tags_ to _git fetch_, deleting local
+	tags that no longer exist on the remote. *Warning:* this also removes
+	tags created locally and never pushed. Default: _false_.
+
 *MAINTENANCE_PRUNE_BRANCHES*
 	Set to _true_ to delete local branches that have been merged into the
 	mainline. The mainline is auto-detected from _origin/HEAD_; if that is
-	not set, _main_ is tried, then _master_. Only runs on non-bare
-	repositories. Default: _false_.
+	not set, _main_ is tried, then _master_. If no mainline can be found,
+	branch pruning is skipped for that repository. The currently checked-out
+	branch and branches checked out in other worktrees are never deleted.
+	Only runs on non-bare repositories. Default: _false_.
 
 *MAINTENANCE_PROTECTED_BRANCHES*
 	Comma-separated list of branch names to never delete, even when
@@ -114,13 +122,13 @@ phases are attempted even if an earlier one fails — errors are logged and
 the repository is counted as failed, but processing continues with the
 remaining phases and repositories.
 
-. *git fetch --all --prune --prune-tags* — fetch from all remotes, removing stale remote-tracking branches and tags.
+. *git fetch --all --prune* — fetch from all remotes, removing stale remote-tracking branches. Adds _--prune-tags_ when _MAINTENANCE_PRUNE_TAGS=true_.
 . *git pack-refs --all* — pack loose reference files into a single packed-refs file.
 . *git worktree prune* — remove stale worktree administrative files (skipped for bare repositories).
 . *git reflog expire --expire=<MAINTENANCE_REFLOG_EXPIRE> --all* — expire old reflog entries according to the configured cutoff.
 . *git rerere gc* — clean up stale conflict-resolution records from the rerere cache. Always runs; no-op on repositories that do not use rerere.
 . *git notes prune* — remove note refs whose annotated objects no longer exist. Always runs.
-. *git branch -d <merged>* — delete local branches fully merged into the detected mainline. Only runs when _MAINTENANCE_PRUNE_BRANCHES=true_ and the repository is not bare.
+. *git branch -d -- <merged>* — delete local branches fully merged into the detected mainline. Only runs when _MAINTENANCE_PRUNE_BRANCHES=true_ and the repository is not bare.
 . *git maintenance run --task=loose-objects* — consolidate loose objects unconditionally (unlike gc --auto, this does not check thresholds).
 . *git maintenance run --task=incremental-repack* (normal) or *git repack -a -d -f* (aggressive) — pack objects for efficient storage.
 . *git gc --auto* (normal) or *git gc --aggressive --prune=all* (aggressive) — run garbage collection.

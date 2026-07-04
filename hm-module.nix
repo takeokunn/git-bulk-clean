@@ -18,10 +18,14 @@ let
     MAINTENANCE_WORKERS = toString cfg.workers;
     MAINTENANCE_SKIP_SUBMODULES = boolToStr cfg.skipSubmodules;
     MAINTENANCE_SKIP_LFS = boolToStr cfg.skipLfs;
+    MAINTENANCE_PRUNE_TAGS = boolToStr cfg.pruneTags;
     MAINTENANCE_PRUNE_BRANCHES = boolToStr cfg.pruneBranches;
     MAINTENANCE_PROTECTED_BRANCHES = lib.concatStringsSep "," cfg.protectedBranches;
   };
-  envList = lib.mapAttrsToList (name: value: "${name}=${value}") envAttrs;
+  # systemd's Environment= word-splits unquoted values, so repo paths with
+  # spaces need each KEY=value assignment wrapped in escaped double quotes.
+  quoteEnv = s: "\"" + lib.replaceStrings [ "\\" "\"" ] [ "\\\\" "\\\"" ] s + "\"";
+  envList = lib.mapAttrsToList (name: value: quoteEnv "${name}=${value}") envAttrs;
 in
 {
   options.services.git-maintenance = {
@@ -79,6 +83,16 @@ in
       description = "Skip git lfs prune even when filter.lfs is configured";
     };
 
+    pruneTags = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Also delete local tags that no longer exist on the remotes
+        (git fetch --prune-tags). Warning: this removes tags you created
+        locally and never pushed.
+      '';
+    };
+
     pruneBranches = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -113,10 +127,13 @@ in
           Nice = 19;
           IOSchedulingClass = "idle";
 
-          # Security hardening
+          # Security hardening. ProtectSystem must stay at "full" (not
+          # "strict"): strict mounts the whole filesystem — including the
+          # home directory where the repositories live — read-only, which
+          # breaks every git write phase.
           NoNewPrivileges = true;
           PrivateTmp = true;
-          ProtectSystem = "strict";
+          ProtectSystem = "full";
           MemoryDenyWriteExecute = true;
           RestrictNamespaces = true;
           LockPersonality = true;

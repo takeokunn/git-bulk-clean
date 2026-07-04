@@ -52,7 +52,7 @@ $ MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --dry-run
 [git-bulk-clean 14:11:16] dry-run mode — no git commands will be executed
 [git-bulk-clean 14:11:16] starting cycle: 1 repositories (0 bare), 5 workers
 [git-bulk-clean 14:11:16] [1/1] cleaning: ~/ghq/github.com/takeokunn/git-bulk-clean
-[git-bulk-clean 14:11:16]   (dry-run) git fetch --all --prune --prune-tags
+[git-bulk-clean 14:11:16]   (dry-run) git fetch --all --prune
 [git-bulk-clean 14:11:16]   (dry-run) git pack-refs --all
 [git-bulk-clean 14:11:16]   (dry-run) git worktree prune
 [git-bulk-clean 14:11:16]   (dry-run) git reflog expire --expire=30.days.ago --all
@@ -96,7 +96,8 @@ $ MAINTENANCE_GHQ_ENABLE=true git-bulk-clean
 main thread
   │
   ├─ collect_repos()          reads MAINTENANCE_REPOS + ghq list -p
-  │    └─ detect_repo_kind()  one git call per path: validates git repo + bare flag
+  │    └─ probe_repo()        one git call per path: validates git repo + bare flag,
+  │                           dedupes paths that resolve to the same git dir
   │
   ├─ mpsc::channel ──────────────────────────────────────────────────────────
   │    sends RepoInfo { path, is_bare } for every discovered repo
@@ -108,9 +109,9 @@ main thread
   └─ worker 4 ─┘
        │
        └─ clean_repo()
-            phase_fetch         git fetch --all --prune --prune-tags
+            phase_fetch         git fetch --all --prune  (+ --prune-tags if MAINTENANCE_PRUNE_TAGS)
             phase_refs          pack-refs / worktree prune / reflog expire / rerere gc / notes prune
-            phase_branches      branch -d <merged>  (if MAINTENANCE_PRUNE_BRANCHES, non-bare)
+            phase_branches      branch -d -- <merged>  (if MAINTENANCE_PRUNE_BRANCHES, non-bare)
             phase_objects       loose-objects / incremental-repack / gc
             phase_indices       commit-graph
             phase_submodules    (if .gitmodules && !bare)
@@ -127,13 +128,13 @@ Each repository runs through these phases in order. All phases are attempted eve
 
 | # | Command | When |
 |---|---------|------|
-| 1 | `git fetch --all --prune --prune-tags` | always |
+| 1 | `git fetch --all --prune` (`--prune-tags` added when `MAINTENANCE_PRUNE_TAGS=true`) | always |
 | 2 | `git pack-refs --all` | always |
 | 3 | `git worktree prune` | always |
 | 4 | `git reflog expire --expire=<REFLOG_EXPIRE> --all` | always |
 | 5 | `git rerere gc` | always |
 | 6 | `git notes prune` | always |
-| 7 | `git branch -d <merged>` | `MAINTENANCE_PRUNE_BRANCHES=true`, non-bare |
+| 7 | `git branch -d -- <merged>` | `MAINTENANCE_PRUNE_BRANCHES=true`, non-bare |
 | 8 | `git maintenance run --task=loose-objects` | always |
 | 9 | `git maintenance run --task=incremental-repack` | normal mode |
 | 9 | `git repack -a -d -f` | aggressive mode |
@@ -317,10 +318,11 @@ All configuration is via environment variables — no config file required.
 | `MAINTENANCE_GHQ_ENABLE` | `false` | `true` → also include all repos from `ghq list -p` |
 | `MAINTENANCE_REFLOG_EXPIRE` | `30.days.ago` | Cutoff passed to `git reflog expire --expire` |
 | `MAINTENANCE_AGGRESSIVE` | `false` | `true` → full repack + `gc --aggressive --prune=all` |
-| `MAINTENANCE_INTERVAL` | `86400` | Daemon sleep between cycles (seconds) |
+| `MAINTENANCE_INTERVAL` | `86400` | Daemon sleep between cycles (seconds; 0 or invalid falls back to default) |
 | `MAINTENANCE_WORKERS` | `5` | Parallel worker threads (0 falls back to default) |
 | `MAINTENANCE_SKIP_SUBMODULES` | `false` | `true` → skip submodule sync/gc even if `.gitmodules` exists |
 | `MAINTENANCE_SKIP_LFS` | `false` | `true` → skip `git lfs prune` even if LFS is configured |
+| `MAINTENANCE_PRUNE_TAGS` | `false` | `true` → `git fetch --prune-tags`: deletes local tags missing from the remote (**including unpushed tags**) |
 | `MAINTENANCE_PRUNE_BRANCHES` | `false` | `true` → delete local branches merged into the mainline (non-bare only) |
 | `MAINTENANCE_PROTECTED_BRANCHES` | _(empty)_ | Comma-separated branch names to never delete (mainline is always protected) |
 
@@ -394,6 +396,7 @@ systemctl --user journal -f git-maintenance
 | `workers` | `int` | `5` | Parallel worker threads |
 | `skipSubmodules` | `bool` | `false` | Skip submodule sync/gc |
 | `skipLfs` | `bool` | `false` | Skip `git lfs prune` |
+| `pruneTags` | `bool` | `false` | Delete local tags missing from the remote (removes unpushed tags too) |
 | `pruneBranches` | `bool` | `false` | Delete merged local branches |
 | `protectedBranches` | `[str]` | `[]` | Branches to never delete |
 
