@@ -24,8 +24,14 @@ variable, from _ghq list -p_ (when _MAINTENANCE_GHQ_ENABLE=true_), or
 both. Paths that do not exist or are not valid Git repositories are
 silently ignored.
 
-Bare repositories are detected automatically; phases that require a
-working tree (worktree prune, submodule operations) are skipped for them.
+Bare repositories are detected automatically. Worktree pruning, branch pruning,
+and submodule operations, which require a working tree, are skipped for them.
+
+Run git-bulk-clean only on repositories owned and managed by the current
+operating-system user. Repository discovery is not a security scanner or
+sandbox. Do not process repositories whose Git directory, configuration,
+objects, worktrees, or configured helper programs can be modified by another
+user or by untrusted automation.
 
 # OPTIONS
 
@@ -34,9 +40,10 @@ working tree (worktree prune, submodule operations) are skipped for them.
 	cycles. Send SIGINT or SIGTERM to stop.
 
 *--dry-run*
-	Print every git command that would be executed without actually running
-	any of them. Useful for auditing what git-bulk-clean will do before
-	committing.
+	Print repository-changing Git commands without running them. Read-only
+	detection commands still run to validate repositories and determine bare
+	status, mainline branches, and LFS configuration. Useful for auditing the
+	maintenance plan before a changing run.
 
 *--list*
 	Print all discovered repositories with their type (_norm_ for a normal
@@ -68,8 +75,10 @@ working tree (worktree prune, submodule operations) are skipped for them.
 	addition to those listed in _MAINTENANCE_REPOS_. Default: _false_.
 
 *MAINTENANCE_REFLOG_EXPIRE*
-	Cutoff date passed to _git reflog expire --expire_. Accepts any value
-	that git understands as a date (e.g. _90.days.ago_, _2024-01-01_).
+	Cutoff date passed to _git reflog expire --expire_. Values may contain
+	ASCII letters, digits, dots, hyphens, and spaces. _never_ is accepted;
+	_now_ and _all_ are rejected. Other Git date syntax, including ISO 8601
+	timestamps containing colons, is replaced with the default after a warning.
 	Default: _30.days.ago_.
 
 *MAINTENANCE_AGGRESSIVE*
@@ -124,13 +133,13 @@ remaining phases and repositories.
 
 . *git fetch --all --prune* — fetch from all remotes, removing stale remote-tracking branches. Adds _--prune-tags_ when _MAINTENANCE_PRUNE_TAGS=true_.
 . *git pack-refs --all* — pack loose reference files into a single packed-refs file.
-. *git worktree prune* — remove stale worktree administrative files (skipped for bare repositories).
+. *git worktree prune* — remove stale worktree administrative files. Skipped for bare repositories.
 . *git reflog expire --expire=<MAINTENANCE_REFLOG_EXPIRE> --all* — expire old reflog entries according to the configured cutoff.
 . *git rerere gc* — clean up stale conflict-resolution records from the rerere cache. Always runs; no-op on repositories that do not use rerere.
 . *git notes prune* — remove note refs whose annotated objects no longer exist. Always runs.
 . *git branch -d -- <merged>* — delete local branches fully merged into the detected mainline. Only runs when _MAINTENANCE_PRUNE_BRANCHES=true_ and the repository is not bare.
 . *git maintenance run --task=loose-objects* — consolidate loose objects unconditionally (unlike gc --auto, this does not check thresholds).
-. *git maintenance run --task=incremental-repack* (normal) or *git repack -a -d -f* (aggressive) — pack objects for efficient storage.
+. *git maintenance run --task=incremental-repack* (normal) or *git repack -a -d -f* (aggressive) — pack objects for efficient storage. In normal mode, incremental repacking is skipped when no pack file is available after the loose-objects task.
 . *git gc --auto* (normal) or *git gc --aggressive --prune=all* (aggressive) — run garbage collection.
 . *git maintenance run --task=commit-graph* — write or update the commit-graph file for faster graph traversal.
 . *git submodule sync --recursive* and *git submodule foreach git gc --auto* — synchronise submodule URLs and compact their object stores. Skipped when _.gitmodules_ is absent, the repository is bare, or _MAINTENANCE_SKIP_SUBMODULES=true_.
@@ -144,10 +153,28 @@ remaining phases and repositories.
 *1*
 	One or more repositories encountered errors during processing.
 
+*2*
+	The command line contains an invalid option or argument.
+
+# SECURITY
+
+Maintenance can permanently remove reflog entries, unreachable objects, stale
+worktree metadata, LFS cache objects, local tags when tag pruning is enabled,
+and merged local branches when branch pruning is enabled. Keep independent
+backups of irreplaceable work and inspect both *--list* and *--dry-run* before
+the first changing run.
+
+Dry-run prevents maintenance commands from changing repositories, but it is
+not a sandbox: Git is still invoked for read-only repository, mainline, and LFS
+detection, the filesystem is checked for submodule metadata, and repository-local
+configuration may select helper programs. Do not target
+shared, other-user-writable, or otherwise untrusted repositories. See the
+project's SECURITY.md for vulnerability reporting and supported versions.
+
 # EXAMPLES
 
-Print every command that would run across all ghq-managed repositories
-without executing anything:
+Preview changing commands across all ghq-managed repositories while allowing
+read-only detection commands to run:
 
 ```
 MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --dry-run

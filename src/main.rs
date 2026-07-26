@@ -9,10 +9,11 @@
 use std::collections::HashSet;
 use std::env;
 use std::num::NonZeroUsize;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use std::thread;
@@ -25,6 +26,22 @@ const DEFAULT_REFLOG_EXPIRE: &str = "30.days.ago";
 const DEFAULT_INTERVAL_SECS: u64 = 86400;
 const MAX_WORKERS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const DANGEROUS_GIT_ENV: [&str; 14] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_EXEC_PATH",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+];
 
 // ── target shells ─────────────────────────────────────────────────────────────
 
@@ -141,7 +158,7 @@ _git_bulk_clean() {
     local -a opts
     opts=(
         '--daemon[loop forever, sleeping MAINTENANCE_INTERVAL between cycles]'
-        '--dry-run[show what would run without executing git commands]'
+        '--dry-run[skip mutating Git commands; read-only detection still runs]'
         '--list[print discovered repositories and exit]'
         '--version[print version and exit]'
         '-V[print version and exit]'
@@ -161,7 +178,7 @@ const COMPLETION_FISH: &str = r#"# fish completion for git-bulk-clean
 complete -c git-bulk-clean -f
 
 complete -c git-bulk-clean -l daemon                -d 'Loop forever, sleeping MAINTENANCE_INTERVAL between cycles'
-complete -c git-bulk-clean -l dry-run               -d 'Show what would run without executing git commands'
+complete -c git-bulk-clean -l dry-run               -d 'Skip mutating Git commands; read-only detection still runs'
 complete -c git-bulk-clean -l list                  -d 'Print discovered repositories and exit'
 complete -c git-bulk-clean -l version               -d 'Print version and exit'
 complete -c git-bulk-clean -s V                     -d 'Print version and exit'
@@ -255,6 +272,9 @@ where
 
 fn is_valid_reflog_expire(v: &str) -> bool {
     let v = v.trim();
+    if v.is_empty() {
+        return false;
+    }
     // "never" safely disables expiry (git parses these case-insensitively)
     if v.eq_ignore_ascii_case("never") {
         return true;
@@ -321,57 +341,65 @@ struct RepoInfo {
     kind: RepoKind,
 }
 
-fn ghq_repos() -> Vec<String> {
-    Command::new("ghq")
+fn ghq_repos() -> Result<Vec<String>, String> {
+    let output = Command::new("ghq")
         .args(["list", "-p"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            log("warning: ghq list failed or ghq not found");
-            vec![]
-        })
+        .map_err(|error| format!("failed to run ghq list -p: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("ghq list -p exited with {}", output.status));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
 }
 
 // Returns None if `dir` is not a git repository. A single git call covers the
 // validity check, the bare/normal distinction, and the canonical git dir used
 // to deduplicate repos reached via different spellings (trailing slash,
 // symlink, subdirectory of a working tree).
-fn probe_repo(dir: &str) -> Option<(RepoKind, String)> {
-    Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
+fn probe_repo(dir: &str) -> Option<(RepoKind, String, String)> {
+    let canonical_path = std::fs::canonicalize(dir).ok()?;
+    if !canonical_path.is_dir() {
+        return None;
+    }
+    let canonical_path = canonical_path.to_string_lossy().into_owned();
+
+    hardened_git_command()
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
-        .args(["rev-parse", "--is-bare-repository", "--absolute-git-dir"])
-        .current_dir(dir)
+        .args([
+            "rev-parse",
+            "--is-bare-repository",
+            "--absolute-git-dir",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .current_dir(&canonical_path)
         .output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| {
-            // Output lines follow argument order: is-bare flag, then git dir
+            // The common dir identifies linked worktrees that share objects and locks.
             let mut lines = s.lines();
             let is_bare = lines.next()?.trim() == "true";
-            let git_dir = lines.next()?.trim().to_string();
-            Some((RepoKind::from_is_bare(is_bare), git_dir))
+            let _git_dir = lines.next()?;
+            let common_dir = lines.next()?.trim().to_string();
+            Some((RepoKind::from_is_bare(is_bare), common_dir, canonical_path))
         })
 }
 
-fn collect_repos(cfg: &Config) -> Vec<RepoInfo> {
+fn collect_repos(cfg: &Config) -> Result<Vec<RepoInfo>, String> {
     let mut candidates: Vec<String> = {
         let mut seen: HashSet<String> = cfg.repos.iter().cloned().collect();
         if cfg.ghq_enable {
-            seen.extend(ghq_repos());
+            seen.extend(ghq_repos()?);
         }
         seen.into_iter().collect()
     };
@@ -379,36 +407,87 @@ fn collect_repos(cfg: &Config) -> Vec<RepoInfo> {
     // deterministic, and the final list stays ordered by path.
     candidates.sort();
 
+    let candidates = Arc::new(candidates);
+    let next = Arc::new(AtomicUsize::new(0));
+    let worker_count = cfg.num_workers.get().min(candidates.len());
+    let handles: Vec<_> = (0..worker_count)
+        .map(|_| {
+            let candidates = Arc::clone(&candidates);
+            let next = Arc::clone(&next);
+            thread::spawn(move || {
+                let mut found = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = candidates.get(index) else {
+                        break;
+                    };
+                    if let Some((kind, git_dir, path)) = probe_repo(path) {
+                        found.push((index, git_dir, RepoInfo { path, kind }));
+                    }
+                }
+                found
+            })
+        })
+        .collect();
+
+    let mut probed = Vec::new();
+    let mut panicked = 0;
+    for handle in handles {
+        match handle.join() {
+            Ok(found) => probed.extend(found),
+            Err(_) => panicked += 1,
+        }
+    }
+    if panicked > 0 {
+        return Err(format!(
+            "{panicked} repository discovery worker thread(s) panicked"
+        ));
+    }
+    probed.sort_by_key(|(index, _, _)| *index);
+
     let mut seen_git_dirs: HashSet<String> = HashSet::new();
     let mut repos: Vec<RepoInfo> = Vec::new();
-    for path in candidates {
-        if !Path::new(&path).is_dir() {
-            continue;
-        }
-        let Some((kind, git_dir)) = probe_repo(&path) else {
-            continue;
-        };
+    for (_, git_dir, repo) in probed {
         // Two workers running gc on the same repo concurrently fight over
         // git's locks, so drop paths that resolve to an already-seen git dir.
         if seen_git_dirs.insert(git_dir) {
-            repos.push(RepoInfo { path, kind });
+            repos.push(repo);
         }
     }
-    repos
+    Ok(repos)
 }
 
 // ── git command helpers ───────────────────────────────────────────────────────
 
-fn git(dir: &str, args: &[&str]) -> bool {
-    match Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_COUNT", "3")
+fn hardened_git_command() -> Command {
+    let mut command = Command::new("git");
+    for key in DANGEROUS_GIT_ENV {
+        command.env_remove(key);
+    }
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+fn maintenance_git_command() -> Command {
+    let mut command = hardened_git_command();
+    command
+        .env("GIT_CONFIG_COUNT", "5")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
         .env("GIT_CONFIG_KEY_1", "credential.helper")
         .env("GIT_CONFIG_VALUE_1", "")
         .env("GIT_CONFIG_KEY_2", "core.fsmonitor")
         .env("GIT_CONFIG_VALUE_2", "false")
+        .env("GIT_CONFIG_KEY_3", "core.sshCommand")
+        .env("GIT_CONFIG_VALUE_3", "ssh")
+        .env("GIT_CONFIG_KEY_4", "protocol.ext.allow")
+        .env("GIT_CONFIG_VALUE_4", "never");
+    command
+}
+
+fn git(dir: &str, args: &[&str]) -> bool {
+    match maintenance_git_command()
+        .env("GIT_CONFIG_VALUE_4", "never")
         .args(args)
         .current_dir(dir)
         .stdout(Stdio::null())
@@ -448,8 +527,7 @@ fn has_submodules(dir: &str) -> bool {
 
 fn has_lfs(dir: &str) -> bool {
     // filter.lfs.clean is set iff git-lfs was ever initialised in this repo
-    Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
+    hardened_git_command()
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
@@ -474,9 +552,13 @@ fn phase_fetch(dir: &str, prune_tags: bool) -> bool {
     }
 }
 
-fn phase_refs(dir: &str, reflog_expire: &str) -> bool {
+fn phase_refs(dir: &str, kind: RepoKind, reflog_expire: &str) -> bool {
     let ok = git(dir, &["pack-refs", "--all"]);
-    let ok = ok & git(dir, &["worktree", "prune"]);
+    let ok = if kind.is_bare() {
+        ok
+    } else {
+        ok & git(dir, &["worktree", "prune"])
+    };
     let ok = ok
         & git(
             dir,
@@ -493,8 +575,7 @@ fn phase_refs(dir: &str, reflog_expire: &str) -> bool {
 
 fn local_branch_exists(dir: &str, name: &str) -> bool {
     // Fully qualified so a tag with the same name cannot shadow the branch
-    Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
+    hardened_git_command()
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
@@ -516,8 +597,7 @@ fn local_branch_exists(dir: &str, name: &str) -> bool {
 // then instead of failing every cycle against a nonexistent branch.
 fn detect_mainline(dir: &str) -> Option<String> {
     // Try origin's default branch via symbolic-ref (e.g. "origin/main" → "main")
-    let out = Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let out = hardened_git_command()
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
@@ -555,8 +635,7 @@ fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
         ));
         return true;
     };
-    let out = Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let out = hardened_git_command()
         .env("GIT_CONFIG_COUNT", "3")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
@@ -617,11 +696,41 @@ fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
     }
 }
 
+fn has_packfiles(dir: &str) -> bool {
+    let mut command = hardened_git_command();
+    command
+        .env("GIT_CONFIG_COUNT", "0")
+        .args(["rev-parse", "--git-path", "objects/pack"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|path| {
+            let path = Path::new(path.trim());
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                Path::new(dir).join(path)
+            };
+            std::fs::read_dir(path)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+        })
+        .unwrap_or(false)
+}
+
 fn phase_objects_normal(dir: &str) -> bool {
-    // loose-objects + incremental-repack run unconditionally (gc --auto only runs
-    // above its internal thresholds), then gc finalises pruning
+    // Empty repositories have no pack for incremental-repack to index.
     let ok = git(dir, &["maintenance", "run", "--task=loose-objects"]);
-    let ok = ok & git(dir, &["maintenance", "run", "--task=incremental-repack"]);
+    let ok = if !has_packfiles(dir) {
+        ok
+    } else {
+        ok & git(dir, &["maintenance", "run", "--task=incremental-repack"])
+    };
     ok & git(dir, &["gc", "--auto"])
 }
 
@@ -667,7 +776,9 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
             log("  (dry-run) git fetch --all --prune");
         }
         log("  (dry-run) git pack-refs --all");
-        log("  (dry-run) git worktree prune");
+        if !repo.kind.is_bare() {
+            log("  (dry-run) git worktree prune");
+        }
         log(&format!(
             "  (dry-run) git reflog expire --expire={} --all",
             opts.reflog_expire
@@ -688,7 +799,9 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
             log("  (dry-run) git repack -a -d -f");
             log("  (dry-run) git gc --aggressive --prune=all");
         } else {
-            log("  (dry-run) git maintenance run --task=incremental-repack");
+            log(
+                "  (dry-run) git maintenance run --task=incremental-repack (if a pack is available)",
+            );
             log("  (dry-run) git gc --auto");
         }
         log("  (dry-run) git maintenance run --task=commit-graph");
@@ -703,7 +816,7 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
     }
 
     let ok = phase_fetch(dir, opts.prune_tags)
-        & phase_refs(dir, &opts.reflog_expire)
+        & phase_refs(dir, repo.kind, &opts.reflog_expire)
         & if !repo.kind.is_bare() && opts.prune_branches {
             phase_branches(dir, &opts.protected_branches)
         } else {
@@ -744,8 +857,65 @@ struct CycleStats {
     failed: usize,
 }
 
+fn run_indexed_workers<T, F>(items: Arc<Vec<T>>, configured_workers: usize, work: F) -> usize
+where
+    T: Send + Sync + 'static,
+    F: Fn(&T, usize) -> bool + Send + Sync + 'static,
+{
+    if items.is_empty() {
+        return 0;
+    }
+
+    let worker_count = configured_workers.min(items.len());
+    let next = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let work = Arc::new(work);
+    let handles: Vec<_> = (0..worker_count)
+        .map(|_| {
+            let items = Arc::clone(&items);
+            let next = Arc::clone(&next);
+            let failed = Arc::clone(&failed);
+            let work = Arc::clone(&work);
+            thread::spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    if !catch_unwind(AssertUnwindSafe(|| work(item, index))).unwrap_or(false) {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let panicked = handles
+        .into_iter()
+        .map(|handle| handle.join())
+        .filter(Result::is_err)
+        .count();
+    if panicked > 0 {
+        log(&format!("{panicked} worker thread(s) panicked"));
+    }
+    // Per-item panics are caught above so one bad repository cannot strand
+    // work assigned to the same worker. A thread-level panic is still counted
+    // defensively in case pool code itself fails.
+    failed
+        .load(Ordering::Relaxed)
+        .saturating_add(panicked)
+        .min(items.len())
+}
+
 fn run_cycle(cfg: &Config, dry_run: bool) -> CycleStats {
-    let repos = collect_repos(cfg);
+    let repos = match collect_repos(cfg) {
+        Ok(repos) => repos,
+        Err(error) => {
+            log(&format!("repository discovery failed: {error}"));
+            log("cycle complete: 0 repositories, 1 discovery failure");
+            return CycleStats { failed: 1 };
+        }
+    };
     let total = repos.len();
 
     if total == 0 {
@@ -754,55 +924,17 @@ fn run_cycle(cfg: &Config, dry_run: bool) -> CycleStats {
     }
 
     let bare_count = repos.iter().filter(|r| r.kind.is_bare()).count();
+    let workers = cfg.num_workers.get().min(total);
+    let worker_label = if workers == 1 { "worker" } else { "workers" };
     log(&format!(
-        "starting cycle: {total} repositories ({bare_count} bare), {} workers",
-        cfg.num_workers
+        "starting cycle: {total} repositories ({bare_count} bare), {workers} {worker_label}"
     ));
 
-    let (tx, rx) = std::sync::mpsc::channel::<RepoInfo>();
-    let rx = Arc::new(Mutex::new(rx));
-    let failed_count = Arc::new(AtomicUsize::new(0));
-    let progress = Arc::new(AtomicUsize::new(0));
+    let repos = Arc::new(repos);
     let opts = Arc::new(CleanOptions::from_config(cfg));
-
-    for repo in repos {
-        tx.send(repo).expect("channel send");
-    }
-    drop(tx);
-
-    let handles: Vec<_> = (0..cfg.num_workers.get())
-        .map(|id| {
-            let rx = Arc::clone(&rx);
-            let opts = Arc::clone(&opts);
-            let failed_count = Arc::clone(&failed_count);
-            let progress = Arc::clone(&progress);
-
-            thread::spawn(move || {
-                loop {
-                    match rx.lock().unwrap_or_else(|e| e.into_inner()).recv() {
-                        Ok(repo) => {
-                            let n = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                            if !clean_repo(&repo, &opts, dry_run, n, total) {
-                                failed_count.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Err(_) => {
-                            log(&format!("worker {id}: done"));
-                            break;
-                        }
-                    }
-                }
-            })
-        })
-        .collect();
-
-    for h in handles {
-        if h.join().is_err() {
-            log("a worker thread panicked; cycle may be incomplete");
-        }
-    }
-
-    let failed = failed_count.load(Ordering::Relaxed);
+    let failed = run_indexed_workers(repos, cfg.num_workers.get(), move |repo, index| {
+        clean_repo(repo, &opts, dry_run, index + 1, total)
+    });
     let succeeded = total - failed;
     log(&format!(
         "cycle complete — {succeeded}/{total} ok, {failed} failed"
@@ -864,10 +996,10 @@ fn help_text(prog: &str) -> String {
 
 Options:
   --daemon                      Loop forever, sleeping MAINTENANCE_INTERVAL between cycles
-  --dry-run                     Show what would run without executing git commands
+  --dry-run                     Skip mutating Git commands; read-only detection still runs
   --list                        Print discovered repositories and exit
   --generate-completions SHELL  Print completion script (bash, zsh, fish) and exit
-  --version                     Print version and exit
+  -V, --version                 Print version and exit
   -h, --help                    Print this help and exit
 
 Environment variables:
@@ -886,13 +1018,13 @@ Environment variables:
 Cleanup pipeline (per repo):
   1. git fetch --all --prune                         (--prune-tags if MAINTENANCE_PRUNE_TAGS)
   2. git pack-refs --all
-  3. git worktree prune
+  3. git worktree prune                              (non-bare only)
   4. git reflog expire --expire=<REFLOG_EXPIRE> --all
   5. git rerere gc
   6. git notes prune
   7. git branch -d -- <merged>                       (if MAINTENANCE_PRUNE_BRANCHES, non-bare)
   8. git maintenance run --task=loose-objects
-  9. git maintenance run --task=incremental-repack  (normal)
+  9. git maintenance run --task=incremental-repack  (normal; skipped if no pack after loose-objects)
      git repack -a -d -f                  (aggressive)
  10. git gc --auto                                   (normal)
      git gc --aggressive --prune=all                (aggressive)
@@ -926,7 +1058,13 @@ fn main() {
         }
         Ok(CliAction::List) => {
             let cfg = Config::from_env();
-            let repos = collect_repos(&cfg);
+            let repos = match collect_repos(&cfg) {
+                Ok(repos) => repos,
+                Err(error) => {
+                    log(&format!("repository discovery failed: {error}"));
+                    std::process::exit(1);
+                }
+            };
             if repos.is_empty() {
                 log("no repositories found");
             }
@@ -937,7 +1075,9 @@ fn main() {
         Ok(CliAction::Run { daemon, dry_run }) => {
             let cfg = Config::from_env();
             if dry_run {
-                log("dry-run mode — no git commands will be executed");
+                log(
+                    "dry-run mode: mutating Git commands are skipped; read-only detection still runs",
+                );
             }
             if daemon {
                 log(&format!(
@@ -1127,18 +1267,50 @@ mod tests {
             "MAINTENANCE_REPOS",
             &format!("{repo_path},{repo_path},/no-such-path-xyz"),
         )]);
-        let repos = collect_repos(&cfg);
+        let repos = collect_repos(&cfg).expect("repository discovery should succeed");
         assert_eq!(repos.len(), 1);
-        assert_eq!(repos[0].path, repo_path);
+        assert_eq!(
+            repos[0].path,
+            fs::canonicalize(&tmp).unwrap().to_string_lossy()
+        );
         assert!(!repos[0].kind.is_bare(), "temp repo should not be bare");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collect_deduplicates_linked_worktrees_by_common_dir() {
+        let tmp = make_temp_git_repo("collect_worktree");
+        let linked = tmp.with_extension("linked");
+        let _ = fs::remove_dir_all(&linked);
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "--detach"])
+                .arg(&linked)
+                .current_dir(&tmp)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let cfg = make_config(&[(
+            "MAINTENANCE_REPOS",
+            &format!("{},{}", tmp.display(), linked.display()),
+        )]);
+        assert_eq!(
+            collect_repos(&cfg)
+                .expect("repository discovery should succeed")
+                .len(),
+            1
+        );
+        let _ = fs::remove_dir_all(&linked);
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn probe_repo_project_is_non_bare() {
         let tmp = make_temp_git_repo("detect_kind_nonbare");
-        let (kind, git_dir) = probe_repo(tmp.to_str().unwrap()).expect("should be a repo");
+        let (kind, git_dir, path) = probe_repo(tmp.to_str().unwrap()).expect("should be a repo");
         assert_eq!(kind, RepoKind::Normal);
+        assert_eq!(path, fs::canonicalize(&tmp).unwrap().to_string_lossy());
         assert!(
             git_dir.ends_with(".git"),
             "expected absolute git dir, got {git_dir:?}"
@@ -1164,7 +1336,7 @@ mod tests {
         let tmp = make_temp_git_repo("collect_dedup_slash");
         let repo_path = tmp.to_str().unwrap().to_string();
         let cfg = make_config(&[("MAINTENANCE_REPOS", &format!("{repo_path},{repo_path}/"))]);
-        let repos = collect_repos(&cfg);
+        let repos = collect_repos(&cfg).expect("repository discovery should succeed");
         assert_eq!(
             repos.len(),
             1,
@@ -1558,6 +1730,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn hardened_git_command_removes_repository_redirecting_environment() {
+        let command = hardened_git_command();
+        for key in DANGEROUS_GIT_ENV {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == std::ffi::OsStr::new(key) && value.is_none()),
+                "expected {key} to be removed"
+            );
+        }
+    }
+
+    #[test]
+    fn maintenance_git_command_forces_non_executable_repository_config() {
+        let command = maintenance_git_command();
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_COUNT")),
+            Some(&Some(std::ffi::OsStr::new("5")))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_KEY_3")),
+            Some(&Some(std::ffi::OsStr::new("core.sshCommand")))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_VALUE_3")),
+            Some(&Some(std::ffi::OsStr::new("ssh")))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_KEY_4")),
+            Some(&Some(std::ffi::OsStr::new("protocol.ext.allow")))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_VALUE_4")),
+            Some(&Some(std::ffi::OsStr::new("never")))
+        );
+    }
+
     // ── has_lfs ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -1580,24 +1792,44 @@ mod tests {
     // ── phase functions ──────────────────────────────────────────────────────
 
     #[test]
-    fn phase_fetch_on_repo_without_remotes_does_not_panic() {
+    fn phase_fetch_on_repo_without_remotes_succeeds() {
         let tmp = make_temp_git_repo("phase_fetch");
-        let _ = phase_fetch(tmp.to_str().unwrap(), false);
-        let _ = phase_fetch(tmp.to_str().unwrap(), true);
+        assert!(phase_fetch(tmp.to_str().unwrap(), false));
+        assert!(phase_fetch(tmp.to_str().unwrap(), true));
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn phase_refs_on_fresh_repo_succeeds() {
         let tmp = make_temp_git_repo("phase_refs");
-        assert!(phase_refs(tmp.to_str().unwrap(), "30.days.ago"));
+        assert!(phase_refs(
+            tmp.to_str().unwrap(),
+            RepoKind::Normal,
+            "30.days.ago"
+        ));
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn phase_objects_normal_on_fresh_repo_does_not_panic() {
+    fn phase_objects_normal_on_fresh_repo_succeeds() {
         let tmp = make_temp_git_repo("phase_objects_normal");
-        let _ = phase_objects_normal(tmp.to_str().unwrap());
+        assert!(phase_objects_normal(tmp.to_str().unwrap()));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_objects_normal_on_empty_repo_succeeds() {
+        let tmp = env::temp_dir().join("git_bulk_clean_empty_normal");
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg(&tmp)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(phase_objects_normal(tmp.to_str().unwrap()));
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1609,16 +1841,16 @@ mod tests {
     }
 
     #[test]
-    fn phase_indices_on_fresh_repo_does_not_panic() {
+    fn phase_indices_on_fresh_repo_succeeds() {
         let tmp = make_temp_git_repo("phase_indices");
-        let _ = phase_indices(tmp.to_str().unwrap());
+        assert!(phase_indices(tmp.to_str().unwrap()));
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn phase_submodules_on_repo_without_submodules_does_not_panic() {
+    fn phase_submodules_on_repo_without_submodules_succeeds() {
         let tmp = make_temp_git_repo("phase_submodules");
-        let _ = phase_submodules(tmp.to_str().unwrap());
+        assert!(phase_submodules(tmp.to_str().unwrap()));
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1663,19 +1895,40 @@ mod tests {
     }
 
     #[test]
-    fn clean_repo_live_on_temp_repo_does_not_panic() {
+    fn clean_repo_live_on_temp_repo_succeeds() {
         let tmp = make_temp_git_repo("clean_repo_live");
         let repo = RepoInfo {
             path: tmp.to_str().unwrap().to_string(),
             kind: RepoKind::Normal,
         };
         let opts = CleanOptions::from_config(&make_config(&[("MAINTENANCE_SKIP_LFS", "true")]));
-        let _ = clean_repo(&repo, &opts, false, 1, 1);
+        assert!(clean_repo(&repo, &opts, false, 1, 1));
         let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn clean_repo_live_with_prune_branches_does_not_panic() {
+    fn clean_repo_live_on_empty_bare_repo_succeeds() {
+        let tmp = env::temp_dir().join("git_bulk_clean_empty_bare");
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare"])
+                .arg(&tmp)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let repo = RepoInfo {
+            path: tmp.to_string_lossy().into_owned(),
+            kind: RepoKind::Bare,
+        };
+        let opts = CleanOptions::from_config(&make_config(&[("MAINTENANCE_SKIP_LFS", "true")]));
+        assert!(clean_repo(&repo, &opts, false, 1, 1));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn clean_repo_live_with_prune_branches_succeeds() {
         let tmp = make_temp_git_repo("clean_repo_prune");
         let repo = RepoInfo {
             path: tmp.to_str().unwrap().to_string(),
@@ -1685,7 +1938,7 @@ mod tests {
             ("MAINTENANCE_PRUNE_BRANCHES", "true"),
             ("MAINTENANCE_SKIP_LFS", "true"),
         ]));
-        let _ = clean_repo(&repo, &opts, false, 1, 1);
+        assert!(clean_repo(&repo, &opts, false, 1, 1));
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1705,13 +1958,33 @@ mod tests {
     }
 
     #[test]
-    fn run_cycle_live_on_temp_repo_does_not_panic() {
+    fn indexed_workers_count_panics_as_failures() {
+        let failed = run_indexed_workers(Arc::new(vec![1]), 8, |_, _| panic!("worker panic"));
+        assert_eq!(failed, 1);
+    }
+
+    #[test]
+    fn indexed_workers_continue_after_item_panics() {
+        let processed = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&processed);
+        let failed = run_indexed_workers(Arc::new((0..100).collect()), 4, move |_, index| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            assert!(index % 2 != 0, "intentional item panic");
+            true
+        });
+
+        assert_eq!(processed.load(Ordering::Relaxed), 100);
+        assert_eq!(failed, 50);
+    }
+
+    #[test]
+    fn run_cycle_live_on_temp_repo_succeeds() {
         let tmp = make_temp_git_repo("run_cycle_live");
         let cfg = make_config(&[
             ("MAINTENANCE_REPOS", tmp.to_str().unwrap()),
             ("MAINTENANCE_SKIP_LFS", "true"),
         ]);
-        let _ = run_cycle(&cfg, false);
+        assert_eq!(run_cycle(&cfg, false).failed, 0);
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1751,6 +2024,12 @@ mod tests {
         assert!(!is_valid_reflog_expire("; rm -rf /"));
         assert!(!is_valid_reflog_expire("$(whoami)"));
         assert!(!is_valid_reflog_expire("1970-01-01T00:00:00Z")); // colons not allowed
+    }
+
+    #[test]
+    fn reflog_expire_empty_and_whitespace_rejected() {
+        assert!(!is_valid_reflog_expire(""));
+        assert!(!is_valid_reflog_expire("   \t\n"));
     }
 
     #[test]
@@ -2038,7 +2317,7 @@ mod tests {
             .unwrap();
         // Run with protected-branch in the protected list
         let protected = vec!["protected-branch".to_string()];
-        phase_branches(dir, &protected);
+        assert!(phase_branches(dir, &protected));
         // Verify protected-branch still exists
         let branches = Command::new("git")
             .args(["branch"])
