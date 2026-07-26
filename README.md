@@ -8,7 +8,7 @@
 
 ---
 
-If you manage dozens (or hundreds) of Git repositories locally — especially via [ghq](https://github.com/x-puri/ghq) — they slowly accumulate stale remote-tracking branches, loose objects, oversized reflogs, and orphaned worktrees.  
+If you manage dozens (or hundreds) of Git repositories locally — especially via [ghq](https://github.com/x-motemen/ghq) — they slowly accumulate stale remote-tracking branches, loose objects, oversized reflogs, and orphaned worktrees.
 `git-bulk-clean` automatically traverses every repository and runs the full git housekeeping pipeline in parallel, keeping your local clones lean and fast.
 
 ## Contents
@@ -20,8 +20,10 @@ If you manage dozens (or hundreds) of Git repositories locally — especially vi
 - [Installation](#installation)
 - [Usage](#usage)
 - [Configuration](#configuration)
+- [Security boundary](#security-boundary)
 - [Home Manager integration](#home-manager-integration)
 - [Development](#development)
+- [Contributing and security](#contributing-and-security)
 - [License](#license)
 
 ---
@@ -32,11 +34,11 @@ If you manage dozens (or hundreds) of Git repositories locally — especially vi
 |---|---|
 | **Parallel execution** | Configurable worker pool (default 5) processes repos concurrently |
 | **ghq integration** | `MAINTENANCE_GHQ_ENABLE=true` automatically includes every `ghq` repo |
-| **Bare repo aware** | Detects bare repositories; skips worktree/submodule phases that don't apply |
+| **Bare repo aware** | Detects bare repositories; skips branch and submodule phases that require a working tree |
 | **Submodule support** | Auto-detects `.gitmodules` and runs `sync` + `gc` recursively |
 | **Git LFS support** | Auto-detects `filter.lfs` config and runs `git lfs prune` |
 | **Daemon mode** | `--daemon` loops indefinitely with a configurable sleep interval |
-| **Dry-run mode** | `--dry-run` shows every command without executing anything |
+| **Dry-run mode** | `--dry-run` skips commands that change repositories while retaining read-only detection |
 | **Repo discovery** | `--list` prints all discovered repositories with bare/normal indicator |
 | **Zero dependencies** | Built entirely on Rust's standard library — no `Cargo.lock` bloat |
 | **Nix-native** | Ships a flake with `buildRustPackage`, `wrapProgram`, dev shell, and Home Manager module |
@@ -49,8 +51,7 @@ If you manage dozens (or hundreds) of Git repositories locally — especially vi
 
 ```console
 $ MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --dry-run
-[git-bulk-clean 14:11:16] dry-run mode — no git commands will be executed
-[git-bulk-clean 14:11:16] starting cycle: 1 repositories (0 bare), 5 workers
+[git-bulk-clean 14:11:16] starting cycle: 1 repositories (0 bare), 1 workers
 [git-bulk-clean 14:11:16] [1/1] cleaning: ~/ghq/github.com/takeokunn/git-bulk-clean
 [git-bulk-clean 14:11:16]   (dry-run) git fetch --all --prune
 [git-bulk-clean 14:11:16]   (dry-run) git pack-refs --all
@@ -59,11 +60,9 @@ $ MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --dry-run
 [git-bulk-clean 14:11:16]   (dry-run) git rerere gc
 [git-bulk-clean 14:11:16]   (dry-run) git notes prune
 [git-bulk-clean 14:11:16]   (dry-run) git maintenance run --task=loose-objects
-[git-bulk-clean 14:11:16]   (dry-run) git maintenance run --task=incremental-repack
+[git-bulk-clean 14:11:16]   (dry-run) git maintenance run --task=incremental-repack (if a pack is available)
 [git-bulk-clean 14:11:16]   (dry-run) git gc --auto
 [git-bulk-clean 14:11:16]   (dry-run) git maintenance run --task=commit-graph
-[git-bulk-clean 14:11:16] worker 0: done
-[git-bulk-clean 14:11:16] worker 1: done
 [git-bulk-clean 14:11:16] cycle complete — 1/1 ok, 0 failed
 ```
 
@@ -99,12 +98,12 @@ main thread
   │    └─ probe_repo()        one git call per path: validates git repo + bare flag,
   │                           dedupes paths that resolve to the same git dir
   │
-  ├─ mpsc::channel ──────────────────────────────────────────────────────────
-  │    sends RepoInfo { path, is_bare } for every discovered repo
+  ├─ Arc<Vec<RepoInfo>> + AtomicUsize ───────────────────────────────────────
+  │    immutable task list with a lock-free shared next-item index
   │
   ├─ worker 0 ─┐
-  ├─ worker 1  │  each worker loops: lock receiver → recv → clean_repo → repeat
-  ├─ worker 2  │  exits when channel is exhausted (Err on recv)
+  ├─ worker 1  │  each worker claims an index → clean_repo → repeat
+  ├─ worker 2  │  exits when every index has been claimed
   ├─ worker 3  │
   └─ worker 4 ─┘
        │
@@ -118,7 +117,8 @@ main thread
             phase_lfs           (if filter.lfs configured)
 ```
 
-The receiver is wrapped in `Arc<Mutex<Receiver<RepoInfo>>>` so all five workers safely share a single channel without copying the task list.
+Workers share an immutable `Arc<Vec<RepoInfo>>` and claim work through an
+`AtomicUsize`, avoiding a receiver lock on every repository.
 
 ---
 
@@ -130,13 +130,13 @@ Each repository runs through these phases in order. All phases are attempted eve
 |---|---------|------|
 | 1 | `git fetch --all --prune` (`--prune-tags` added when `MAINTENANCE_PRUNE_TAGS=true`) | always |
 | 2 | `git pack-refs --all` | always |
-| 3 | `git worktree prune` | always |
+| 3 | `git worktree prune` | non-bare |
 | 4 | `git reflog expire --expire=<REFLOG_EXPIRE> --all` | always |
 | 5 | `git rerere gc` | always |
 | 6 | `git notes prune` | always |
 | 7 | `git branch -d -- <merged>` | `MAINTENANCE_PRUNE_BRANCHES=true`, non-bare |
 | 8 | `git maintenance run --task=loose-objects` | always |
-| 9 | `git maintenance run --task=incremental-repack` | normal mode |
+| 9 | `git maintenance run --task=incremental-repack` | normal mode; skipped when no pack is available after `loose-objects` |
 | 9 | `git repack -a -d -f` | aggressive mode |
 | 10 | `git gc --auto` | normal mode |
 | 10 | `git gc --aggressive --prune=all` | aggressive mode |
@@ -144,19 +144,22 @@ Each repository runs through these phases in order. All phases are attempted eve
 | 12 | `git submodule sync --recursive` + `foreach git gc --auto` | `.gitmodules` exists, non-bare |
 | 13 | `git lfs prune` | `filter.lfs` configured in repo |
 
-> **Why run `loose-objects` and `incremental-repack` before `gc`?**  
-> `git gc --auto` only triggers when internal thresholds are exceeded.  
-> The `maintenance` tasks run unconditionally, ensuring objects are always consolidated
-> regardless of repo activity level.
+> **Why run `loose-objects` and `incremental-repack` before `gc`?**
+> `git gc --auto` only triggers when internal thresholds are exceeded.
+> `loose-objects` runs unconditionally. `incremental-repack` then runs when a pack is
+> available, ensuring objects are consolidated without failing on empty repositories.
 
 ---
 
 ## Installation
 
-### Cargo
+### Cargo (from the current release tag)
+
+This project is not published on crates.io. Install the current `v0.4.0`
+source tag directly from GitHub:
 
 ```sh
-cargo install --git https://github.com/takeokunn/git-bulk-clean
+cargo install --git https://github.com/takeokunn/git-bulk-clean --tag v0.4.0 --locked
 ```
 
 ### Nix — one-off run
@@ -195,13 +198,14 @@ All repository discovery and tuning is done via environment variables — there 
 |------|-------------|
 | _(none)_ | One-shot: clean every discovered repository and exit |
 | `--daemon` | Loop forever, sleeping `MAINTENANCE_INTERVAL` seconds between cycles |
-| `--dry-run` | Print every git command that would run — nothing is executed |
+| `--dry-run` | Print repository-changing Git commands without running them; read-only repository, mainline, and LFS detection still runs |
 | `--list` | Print all discovered repositories (`norm` / `bare`) and exit |
 | `--generate-completions SHELL` | Print the completion script for `bash`, `zsh`, or `fish` and exit |
 | `-V`, `--version` | Print version and exit |
 | `-h`, `--help` | Print a usage summary and exit |
 
-Exit code is `0` on full success, `1` if any repository encountered errors.
+Exit code is `0` on full success, `1` if any repository encountered errors,
+and `2` for invalid command-line arguments.
 
 ---
 
@@ -215,7 +219,7 @@ Always start with `--list` and `--dry-run` to verify what will happen:
 # See which repositories were discovered
 MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --list
 
-# See every git command that would be executed, without running any
+# Preview changing commands; read-only detection still runs
 MAINTENANCE_GHQ_ENABLE=true git-bulk-clean --dry-run
 ```
 
@@ -279,7 +283,11 @@ MAINTENANCE_GHQ_ENABLE=true \
 MAINTENANCE_GHQ_ENABLE=true MAINTENANCE_REFLOG_EXPIRE=90.days.ago git-bulk-clean
 ```
 
-Any date string accepted by git works: `90.days.ago`, `2024-01-01`, `never`.
+Accepted values are intentionally limited to ASCII letters, digits, dots,
+hyphens, and spaces. Examples include `90.days.ago`, `2024-01-01`, and `never`;
+the immediately destructive values `now` and `all` are rejected. Other date
+syntax that Git may accept, such as ISO 8601 timestamps containing colons, is
+rejected and replaced with the safe default `30.days.ago` after a warning.
 
 ---
 
@@ -327,6 +335,28 @@ All configuration is via environment variables — no config file required.
 | `MAINTENANCE_PROTECTED_BRANCHES` | _(empty)_ | Comma-separated branch names to never delete (mainline is always protected) |
 
 Paths listed in `MAINTENANCE_REPOS` that do not exist or are not git repositories are silently ignored.
+
+## Security boundary
+
+Run `git-bulk-clean` only on repositories that the current operating-system
+user owns and manages, and whose Git configuration and hooks are trusted.
+Repository discovery is not a security scanner or sandbox. Do not include a
+repository whose `.git` directory, configuration, objects, worktrees, or helper
+programs can be modified by another user or by untrusted automation. In
+particular, avoid shared or other-user-writable repositories and repositories
+that configure arbitrary credential, transport, filter, diff, or LFS helpers.
+
+Maintenance changes repository metadata and may permanently remove reflog
+entries, unreachable objects, stale worktree metadata, LFS cache objects, local
+tags when tag pruning is enabled, and merged local branches when branch pruning
+is enabled. Keep independent backups of irreplaceable work and inspect both
+`--list` and `--dry-run` before the first changing run. Dry-run prevents the
+maintenance commands from changing repositories, but it still invokes Git for
+read-only repository, mainline, and LFS detection and checks the filesystem for
+submodule metadata.
+
+See [SECURITY.md](SECURITY.md) for vulnerability reporting and the supported
+security scope.
 
 ---
 
@@ -376,12 +406,16 @@ The same options drive both backends.
 }
 ```
 
-After `home-manager switch`, the service starts automatically on login:
+After `home-manager switch`, the service or agent starts automatically on login.
+On Linux, inspect the systemd user service with:
 
 ```sh
 systemctl --user status git-maintenance
 systemctl --user journal -f git-maintenance
 ```
+
+On macOS, inspect `~/Library/Logs/git-maintenance.log` and manage the generated
+launchd agent through Home Manager.
 
 ### Available options
 
@@ -438,7 +472,7 @@ git-bulk-clean/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── flake.nix         # Nix package, dev shell, app, homeManagerModules
-├── hm-module.nix     # Home Manager module (systemd user service)
+├── hm-module.nix     # Home Manager module (Linux systemd / macOS launchd)
 ├── man/
 │   └── git-bulk-clean.1.scd  # scdoc man page (built by the Nix package)
 └── .github/
@@ -447,6 +481,16 @@ git-bulk-clean/
     │   └── main.yml  # triggers on push to main
     └── dependabot.yml
 ```
+
+---
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. For
+security vulnerabilities, do not open a public issue; follow
+[SECURITY.md](SECURITY.md). Project changes are recorded in
+[CHANGELOG.md](CHANGELOG.md). Community participation follows
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ---
 
