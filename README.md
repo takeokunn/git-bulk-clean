@@ -110,6 +110,7 @@ main thread
        └─ clean_repo()
             phase_fetch         git fetch --all --prune  (+ --prune-tags if MAINTENANCE_PRUNE_TAGS)
             phase_refs          pack-refs / worktree prune / reflog expire / rerere gc / notes prune
+            phase_worktrees     worktree remove -- <stale>  (if MAINTENANCE_PRUNE_WORKTREES)
             phase_branches      branch -d -- <merged>  (if MAINTENANCE_PRUNE_BRANCHES, non-bare)
             phase_objects       loose-objects / incremental-repack / gc
             phase_indices       commit-graph
@@ -131,18 +132,19 @@ Each repository runs through these phases in order. All phases are attempted eve
 | 1 | `git fetch --all --prune` (`--prune-tags` added when `MAINTENANCE_PRUNE_TAGS=true`) | always |
 | 2 | `git pack-refs --all` | always |
 | 3 | `git worktree prune` | non-bare |
-| 4 | `git reflog expire --expire=<REFLOG_EXPIRE> --all` | always |
-| 5 | `git rerere gc` | always |
-| 6 | `git notes prune` | always |
-| 7 | `git branch -d -- <merged>` | `MAINTENANCE_PRUNE_BRANCHES=true`, non-bare |
-| 8 | `git maintenance run --task=loose-objects` | always |
-| 9 | `git maintenance run --task=incremental-repack` | normal mode; skipped when no pack is available after `loose-objects` |
-| 9 | `git repack -a -d -f` | aggressive mode |
-| 10 | `git gc --auto` | normal mode |
-| 10 | `git gc --aggressive --prune=all` | aggressive mode |
-| 11 | `git maintenance run --task=commit-graph` | always |
-| 12 | `git submodule sync --recursive` + `foreach git gc --auto` | `.gitmodules` exists, non-bare |
-| 13 | `git lfs prune` | `filter.lfs` configured in repo |
+| 4 | `git worktree remove -- <stale>` | `MAINTENANCE_PRUNE_WORKTREES=true` (merged into mainline, or idle 3+ days) |
+| 5 | `git reflog expire --expire=<REFLOG_EXPIRE> --all` | always |
+| 6 | `git rerere gc` | always |
+| 7 | `git notes prune` | always |
+| 8 | `git branch -d -- <merged>` | `MAINTENANCE_PRUNE_BRANCHES=true`, non-bare |
+| 9 | `git maintenance run --task=loose-objects` | always |
+| 10 | `git maintenance run --task=incremental-repack` | normal mode; skipped when no pack is available after `loose-objects` |
+| 10 | `git repack -a -d -f` | aggressive mode |
+| 11 | `git gc --auto` | normal mode |
+| 11 | `git gc --aggressive --prune=all` | aggressive mode |
+| 12 | `git maintenance run --task=commit-graph` | always |
+| 13 | `git submodule sync --recursive` + `foreach git gc --auto` | `.gitmodules` exists, non-bare |
+| 14 | `git lfs prune` | `filter.lfs` configured in repo |
 
 > **Why run `loose-objects` and `incremental-repack` before `gc`?**
 > `git gc --auto` only triggers when internal thresholds are exceeded.
@@ -332,7 +334,8 @@ All configuration is via environment variables — no config file required.
 | `MAINTENANCE_SKIP_LFS` | `false` | `true` → skip `git lfs prune` even if LFS is configured |
 | `MAINTENANCE_PRUNE_TAGS` | `false` | `true` → `git fetch --prune-tags`: deletes local tags missing from the remote (**including unpushed tags**) |
 | `MAINTENANCE_PRUNE_BRANCHES` | `false` | `true` → delete local branches merged into the mainline (non-bare only) |
-| `MAINTENANCE_PROTECTED_BRANCHES` | _(empty)_ | Comma-separated branch names to never delete (mainline is always protected) |
+| `MAINTENANCE_PRUNE_WORKTREES` | `false` | `true` → delete worktree directories merged into the mainline, or idle for 3+ days |
+| `MAINTENANCE_PROTECTED_BRANCHES` | _(empty)_ | Comma-separated branch names to never delete (mainline is always protected); also skips worktrees checked out to a protected branch |
 
 Paths listed in `MAINTENANCE_REPOS` that do not exist or are not git repositories are silently ignored.
 

@@ -180,3 +180,39 @@ fn one_repo_dry_run_output_contract() {
     assert!(stderr.contains("1/1 ok, 0 failed"));
     let _ = fs::remove_dir_all(repo);
 }
+
+#[test]
+fn prune_worktrees_dry_run_output_contract() {
+    let repo = temp_repo();
+    let output = binary()
+        .arg("--dry-run")
+        .env("MAINTENANCE_REPOS", &repo)
+        .env("MAINTENANCE_SKIP_LFS", "true")
+        .env("MAINTENANCE_PRUNE_WORKTREES", "true")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("git worktree remove -- (worktrees merged into mainline or idle 3+ days)")
+    );
+    assert!(stderr.contains("1/1 ok, 0 failed"));
+    let _ = fs::remove_dir_all(repo);
+}
+
+#[test]
+fn prune_worktrees_disabled_by_default_dry_run_output_contract() {
+    let repo = temp_repo();
+    let output = binary()
+        .arg("--dry-run")
+        .env("MAINTENANCE_REPOS", &repo)
+        .env("MAINTENANCE_SKIP_LFS", "true")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("git worktree remove --"));
+    let _ = fs::remove_dir_all(repo);
+}

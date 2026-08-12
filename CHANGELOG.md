@@ -6,6 +6,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added `MAINTENANCE_PRUNE_WORKTREES`: when enabled, deletes worktree
+  directories that are fully merged into the mainline or idle for more than
+  three days, skipping any worktree whose checked-out branch is in
+  `MAINTENANCE_PROTECTED_BRANCHES`.
+
 ## [0.5.0] - 2026-07-26
 
 ### Changed

@@ -25,6 +25,9 @@ const DEFAULT_WORKERS: NonZeroUsize = NonZeroUsize::new(5).unwrap();
 const DEFAULT_REFLOG_EXPIRE: &str = "30.days.ago";
 const DEFAULT_INTERVAL_SECS: u64 = 86400;
 const MAX_WORKERS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+// A worktree whose last commit is older than this, or that is already merged
+// into the mainline, is a stale-worktree deletion candidate.
+const WORKTREE_IDLE_THRESHOLD_SECS: u64 = 3 * 24 * 60 * 60;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DANGEROUS_GIT_ENV: [&str; 14] = [
     "GIT_DIR",
@@ -200,6 +203,7 @@ struct Config {
     skip_lfs: bool,
     prune_tags: bool,
     prune_branches: bool,
+    prune_worktrees: bool,
     protected_branches: Vec<String>,
 }
 
@@ -251,6 +255,7 @@ impl Config {
             skip_lfs: bool_var(&get, "MAINTENANCE_SKIP_LFS", false),
             prune_tags: bool_var(&get, "MAINTENANCE_PRUNE_TAGS", false),
             prune_branches: bool_var(&get, "MAINTENANCE_PRUNE_BRANCHES", false),
+            prune_worktrees: bool_var(&get, "MAINTENANCE_PRUNE_WORKTREES", false),
             protected_branches: get("MAINTENANCE_PROTECTED_BRANCHES")
                 .unwrap_or_default()
                 .split(',')
@@ -296,6 +301,7 @@ struct CleanOptions {
     skip_lfs: bool,
     prune_tags: bool,
     prune_branches: bool,
+    prune_worktrees: bool,
     protected_branches: Vec<String>,
 }
 
@@ -308,6 +314,7 @@ impl CleanOptions {
             skip_lfs: cfg.skip_lfs,
             prune_tags: cfg.prune_tags,
             prune_branches: cfg.prune_branches,
+            prune_worktrees: cfg.prune_worktrees,
             protected_branches: cfg.protected_branches.clone(),
         }
     }
@@ -696,6 +703,119 @@ fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
     }
 }
 
+// Worktrees linked to `dir`, excluding the primary entry (`git worktree
+// list --porcelain` always lists the repository's own worktree — the bare
+// repository itself, for a bare repo — first; it must never be a removal
+// candidate). Each entry is (absolute path, checked-out local branch name).
+fn list_secondary_worktrees(dir: &str) -> Vec<(String, Option<String>)> {
+    let output = hardened_git_command()
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::new();
+    let mut current: Option<(String, Option<String>)> = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some((path.to_string(), None));
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            if let Some((_, name)) = &mut current {
+                *name = Some(branch.to_string());
+            }
+        }
+    }
+    if let Some(entry) = current.take() {
+        entries.push(entry);
+    }
+
+    entries.into_iter().skip(1).collect()
+}
+
+fn worktree_is_merged(wt: &str, mainline: &str) -> bool {
+    hardened_git_command()
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .args(["merge-base", "--is-ancestor", "HEAD", mainline])
+        .current_dir(wt)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// A worktree with no reachable commit (an unborn HEAD) is never idle — an
+// unparseable timestamp must not be mistaken for staleness.
+fn worktree_is_idle(wt: &str) -> bool {
+    let output = hardened_git_command()
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .args(["log", "-1", "--format=%ct", "HEAD"])
+        .current_dir(wt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(commit_secs) = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+    else {
+        return false;
+    };
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(commit_secs);
+    now_secs.saturating_sub(commit_secs) > WORKTREE_IDLE_THRESHOLD_SECS
+}
+
+// Deletes worktree directories that are stale: fully merged into the
+// mainline, or idle for longer than `WORKTREE_IDLE_THRESHOLD_SECS`. A
+// worktree with a locally checked-out branch in `protected_branches` is
+// always skipped. Applies to both bare and non-bare repositories — worktrees
+// can be linked to either.
+fn phase_worktrees(dir: &str, protected_branches: &[String]) -> bool {
+    let mainline = detect_mainline(dir);
+    let mut ok = true;
+    for (path, branch) in list_secondary_worktrees(dir) {
+        if branch
+            .as_ref()
+            .is_some_and(|b| protected_branches.contains(b))
+        {
+            continue;
+        }
+        let merged = mainline
+            .as_deref()
+            .is_some_and(|m| worktree_is_merged(&path, m));
+        let idle = worktree_is_idle(&path);
+        if merged || idle {
+            ok &= git(dir, &["worktree", "remove", "--", &path]);
+        }
+    }
+    ok
+}
+
 fn has_packfiles(dir: &str) -> bool {
     let mut command = hardened_git_command();
     command
@@ -779,6 +899,11 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
         if !repo.kind.is_bare() {
             log("  (dry-run) git worktree prune");
         }
+        if opts.prune_worktrees {
+            log(
+                "  (dry-run) git worktree remove -- (worktrees merged into mainline or idle 3+ days)",
+            );
+        }
         log(&format!(
             "  (dry-run) git reflog expire --expire={} --all",
             opts.reflog_expire
@@ -817,6 +942,11 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
 
     let ok = phase_fetch(dir, opts.prune_tags)
         & phase_refs(dir, repo.kind, &opts.reflog_expire)
+        & if opts.prune_worktrees {
+            phase_worktrees(dir, &opts.protected_branches)
+        } else {
+            true
+        }
         & if !repo.kind.is_bare() && opts.prune_branches {
             phase_branches(dir, &opts.protected_branches)
         } else {
@@ -1013,24 +1143,26 @@ Environment variables:
   MAINTENANCE_SKIP_LFS           true → skip git-lfs prune
   MAINTENANCE_PRUNE_TAGS         true → also delete local tags missing from the remote (fetch --prune-tags)
   MAINTENANCE_PRUNE_BRANCHES     true → delete merged local branches (non-bare only)
+  MAINTENANCE_PRUNE_WORKTREES    true → delete stale worktree dirs (merged into mainline, or idle 3+ days)
   MAINTENANCE_PROTECTED_BRANCHES Comma-separated branch names to protect from deletion
 
 Cleanup pipeline (per repo):
   1. git fetch --all --prune                         (--prune-tags if MAINTENANCE_PRUNE_TAGS)
   2. git pack-refs --all
   3. git worktree prune                              (non-bare only)
-  4. git reflog expire --expire=<REFLOG_EXPIRE> --all
-  5. git rerere gc
-  6. git notes prune
-  7. git branch -d -- <merged>                       (if MAINTENANCE_PRUNE_BRANCHES, non-bare)
-  8. git maintenance run --task=loose-objects
-  9. git maintenance run --task=incremental-repack  (normal; skipped if no pack after loose-objects)
+  4. git worktree remove -- <stale>                  (if MAINTENANCE_PRUNE_WORKTREES)
+  5. git reflog expire --expire=<REFLOG_EXPIRE> --all
+  6. git rerere gc
+  7. git notes prune
+  8. git branch -d -- <merged>                       (if MAINTENANCE_PRUNE_BRANCHES, non-bare)
+  9. git maintenance run --task=loose-objects
+ 10. git maintenance run --task=incremental-repack  (normal; skipped if no pack after loose-objects)
      git repack -a -d -f                  (aggressive)
- 10. git gc --auto                                   (normal)
+ 11. git gc --auto                                   (normal)
      git gc --aggressive --prune=all                (aggressive)
- 11. git maintenance run --task=commit-graph
- 12. git submodule sync + foreach gc                 (if .gitmodules, non-bare only)
- 13. git lfs prune                                   (if LFS configured)
+ 12. git maintenance run --task=commit-graph
+ 13. git submodule sync + foreach gc                 (if .gitmodules, non-bare only)
+ 14. git lfs prune                                   (if LFS configured)
 "
     )
 }
@@ -2118,6 +2250,27 @@ mod tests {
         assert_eq!(opts.protected_branches, ["main", "develop"]);
     }
 
+    // ── MAINTENANCE_PRUNE_WORKTREES ───────────────────────────────────────────
+
+    #[test]
+    fn config_prune_worktrees_defaults_false() {
+        let cfg = make_config(&[]);
+        assert!(!cfg.prune_worktrees);
+    }
+
+    #[test]
+    fn config_prune_worktrees_enabled() {
+        let cfg = make_config(&[("MAINTENANCE_PRUNE_WORKTREES", "true")]);
+        assert!(cfg.prune_worktrees);
+    }
+
+    #[test]
+    fn clean_options_mirrors_prune_worktrees_field() {
+        let cfg = make_config(&[("MAINTENANCE_PRUNE_WORKTREES", "true")]);
+        let opts = CleanOptions::from_config(&cfg);
+        assert!(opts.prune_worktrees);
+    }
+
     // ── detect_mainline ──────────────────────────────────────────────────────
 
     #[test]
@@ -2422,6 +2575,209 @@ mod tests {
             text.contains("MAINTENANCE_PROTECTED_BRANCHES"),
             "help text missing MAINTENANCE_PROTECTED_BRANCHES"
         );
+    }
+
+    #[test]
+    fn help_text_contains_prune_worktrees_env_var() {
+        let text = help_text("git-bulk-clean");
+        assert!(
+            text.contains("MAINTENANCE_PRUNE_WORKTREES"),
+            "help text missing MAINTENANCE_PRUNE_WORKTREES"
+        );
+    }
+
+    // ── phase_worktrees ──────────────────────────────────────────────────────
+
+    #[test]
+    fn phase_worktrees_removes_merged_worktree() {
+        let tmp = make_temp_git_repo("phase_worktrees_merged");
+        let dir = tmp.to_str().unwrap();
+        let mainline = detect_mainline(dir).unwrap();
+        let linked = tmp.with_extension("linked_merged");
+        let _ = fs::remove_dir_all(&linked);
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "--detach"])
+                .arg(&linked)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // A fresh detached worktree checks out the mainline tip, so it is
+        // trivially merged into it.
+        assert!(phase_worktrees(dir, &[]));
+        assert!(
+            !linked.exists(),
+            "merged worktree directory should have been removed"
+        );
+        let worktrees = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&worktrees.stdout).contains(&*linked.to_string_lossy()),
+            "removed worktree must no longer be registered"
+        );
+        let _ = mainline;
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_worktrees_dry_run_leaves_merged_worktree() {
+        let tmp = make_temp_git_repo("phase_worktrees_dry_run");
+        let dir = tmp.to_str().unwrap();
+        let linked = tmp.with_extension("linked_dry_run");
+        let _ = fs::remove_dir_all(&linked);
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "--detach"])
+                .arg(&linked)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let repo = RepoInfo {
+            path: dir.to_string(),
+            kind: RepoKind::Normal,
+        };
+        let opts =
+            CleanOptions::from_config(&make_config(&[("MAINTENANCE_PRUNE_WORKTREES", "true")]));
+        assert!(clean_repo(&repo, &opts, true, 1, 1));
+        assert!(
+            linked.exists(),
+            "dry-run must never remove a worktree directory"
+        );
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_worktrees_keeps_unmerged_recent_worktree() {
+        let tmp = make_temp_git_repo("phase_worktrees_unmerged");
+        let dir = tmp.to_str().unwrap();
+        let linked = tmp.with_extension("linked_unmerged");
+        let _ = fs::remove_dir_all(&linked);
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "-b", "feature/unmerged"])
+                .arg(&linked)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(linked.join("unmerged.txt"), "x").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&linked)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "unmerged work"])
+                .current_dir(&linked)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(phase_worktrees(dir, &[]));
+        assert!(
+            linked.exists(),
+            "recent, unmerged worktree must survive pruning"
+        );
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_worktrees_skips_protected_branch() {
+        let tmp = make_temp_git_repo("phase_worktrees_protected");
+        let dir = tmp.to_str().unwrap();
+        let linked = tmp.with_extension("linked_protected");
+        let _ = fs::remove_dir_all(&linked);
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "-b", "protected-worktree"])
+                .arg(&linked)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // A fresh checkout at the mainline tip is trivially merged, so this
+        // worktree would otherwise be a removal candidate.
+        let protected = vec!["protected-worktree".to_string()];
+        assert!(phase_worktrees(dir, &protected));
+        assert!(
+            linked.exists(),
+            "worktree with a protected checked-out branch must survive pruning"
+        );
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_worktrees_never_touches_primary_worktree() {
+        let tmp = make_temp_git_repo("phase_worktrees_primary");
+        let dir = tmp.to_str().unwrap();
+        assert!(phase_worktrees(dir, &[]));
+        assert!(tmp.exists(), "primary worktree must never be removed");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn worktree_is_idle_false_on_unborn_head() {
+        let tmp = env::temp_dir().join("git_bulk_clean_worktree_idle_unborn");
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg(&tmp)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            !worktree_is_idle(tmp.to_str().unwrap()),
+            "a repo with no commits must not be treated as idle"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn list_secondary_worktrees_excludes_primary_entry() {
+        let tmp = make_temp_git_repo("list_secondary_worktrees");
+        let dir = tmp.to_str().unwrap();
+        assert!(
+            list_secondary_worktrees(dir).is_empty(),
+            "a repo with no linked worktrees has no secondary entries"
+        );
+        let linked = tmp.with_extension("linked_list");
+        let _ = fs::remove_dir_all(&linked);
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "--detach"])
+                .arg(&linked)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let entries = list_secondary_worktrees(dir);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].0,
+            fs::canonicalize(&linked).unwrap().to_string_lossy()
+        );
+        assert_eq!(entries[0].1, None, "detached worktree has no branch");
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     // ── Shell ────────────────────────────────────────────────────────────────
