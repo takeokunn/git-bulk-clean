@@ -64,6 +64,49 @@ fn path_with(dir: &Path) -> String {
     )
 }
 
+fn resolve_real_git() -> PathBuf {
+    let path = std::env::var("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("git not found on PATH")
+}
+
+// Intercepts every git invocation, appends its argv and GIT_CONFIG_* env to
+// `log` as one record delimited by a "---" line, then execs the real git so
+// the maintenance run still completes normally.
+fn git_stub(dir: &Path, real_git: &Path, log: &Path) {
+    let path = dir.join("git");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n{{\n  printf '%s\\n' \"$*\"\n  env | grep '^GIT_CONFIG_'\n  printf -- '---\\n'\n}} >> \"{log}\"\nexec \"{real_git}\" \"$@\"\n",
+            log = log.display(),
+            real_git = real_git.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+fn git_stub_records(log: &Path) -> Vec<String> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .split("---\n")
+        .map(str::to_string)
+        .filter(|record| !record.trim().is_empty())
+        .collect()
+}
+
+fn find_git_stub_record<'a>(records: &'a [String], argv: &str) -> &'a str {
+    records
+        .iter()
+        .find(|record| record.lines().next() == Some(argv))
+        .unwrap_or_else(|| panic!("no recorded git invocation {argv:?} among {records:?}"))
+}
+
 #[test]
 fn help_exits_zero() {
     assert_eq!(binary().arg("--help").status().unwrap().code(), Some(0));
@@ -215,4 +258,64 @@ fn prune_worktrees_disabled_by_default_dry_run_output_contract() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("git worktree remove --"));
     let _ = fs::remove_dir_all(repo);
+}
+
+#[test]
+fn credential_helpers_env_var_lets_only_remote_phases_use_configured_helpers() {
+    let repo = temp_repo();
+    let stubs = temp_dir("credential_helpers_on");
+    let real_git = resolve_real_git();
+    let log = stubs.join("git-stub.log");
+    git_stub(&stubs, &real_git, &log);
+
+    let status = binary()
+        .env("PATH", path_with(&stubs))
+        .env("MAINTENANCE_REPOS", &repo)
+        .env("MAINTENANCE_SKIP_LFS", "true")
+        .env("MAINTENANCE_CREDENTIAL_HELPERS", "true")
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let records = git_stub_records(&log);
+    let fetch = find_git_stub_record(&records, "fetch --all --prune");
+    assert!(
+        !fetch.contains("credential.helper"),
+        "fetch must not reset credential.helper when opted in: {fetch}"
+    );
+    let pack_refs = find_git_stub_record(&records, "pack-refs --all");
+    assert!(
+        pack_refs.contains("credential.helper"),
+        "a local phase must still reset credential.helper: {pack_refs}"
+    );
+
+    let _ = fs::remove_dir_all(repo);
+    let _ = fs::remove_dir_all(stubs);
+}
+
+#[test]
+fn credential_helpers_env_var_defaults_to_resetting_helper_on_fetch() {
+    let repo = temp_repo();
+    let stubs = temp_dir("credential_helpers_off");
+    let real_git = resolve_real_git();
+    let log = stubs.join("git-stub.log");
+    git_stub(&stubs, &real_git, &log);
+
+    let status = binary()
+        .env("PATH", path_with(&stubs))
+        .env("MAINTENANCE_REPOS", &repo)
+        .env("MAINTENANCE_SKIP_LFS", "true")
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let records = git_stub_records(&log);
+    let fetch = find_git_stub_record(&records, "fetch --all --prune");
+    assert!(
+        fetch.contains("credential.helper"),
+        "fetch must reset credential.helper by default: {fetch}"
+    );
+
+    let _ = fs::remove_dir_all(repo);
+    let _ = fs::remove_dir_all(stubs);
 }

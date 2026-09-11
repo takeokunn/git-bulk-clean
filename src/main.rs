@@ -205,6 +205,7 @@ struct Config {
     prune_branches: bool,
     prune_worktrees: bool,
     protected_branches: Vec<String>,
+    credential_helpers: bool,
 }
 
 impl Config {
@@ -262,6 +263,7 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            credential_helpers: bool_var(&get, "MAINTENANCE_CREDENTIAL_HELPERS", false),
         }
     }
 }
@@ -303,6 +305,7 @@ struct CleanOptions {
     prune_branches: bool,
     prune_worktrees: bool,
     protected_branches: Vec<String>,
+    credential_helpers: bool,
 }
 
 impl CleanOptions {
@@ -316,6 +319,7 @@ impl CleanOptions {
             prune_branches: cfg.prune_branches,
             prune_worktrees: cfg.prune_worktrees,
             protected_branches: cfg.protected_branches.clone(),
+            credential_helpers: cfg.credential_helpers,
         }
     }
 }
@@ -475,26 +479,37 @@ fn hardened_git_command() -> Command {
     command
 }
 
-fn maintenance_git_command() -> Command {
+fn maintenance_git_command(credential_helpers: bool) -> Command {
     let mut command = hardened_git_command();
-    command
-        .env("GIT_CONFIG_COUNT", "5")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
-        .env("GIT_CONFIG_KEY_1", "credential.helper")
-        .env("GIT_CONFIG_VALUE_1", "")
-        .env("GIT_CONFIG_KEY_2", "core.fsmonitor")
-        .env("GIT_CONFIG_VALUE_2", "false")
-        .env("GIT_CONFIG_KEY_3", "core.sshCommand")
-        .env("GIT_CONFIG_VALUE_3", "ssh")
-        .env("GIT_CONFIG_KEY_4", "protocol.ext.allow")
-        .env("GIT_CONFIG_VALUE_4", "never");
+    let mut entries = vec![("core.hooksPath", "/dev/null")];
+    if !credential_helpers {
+        // An empty entry at this (last) config layer resets the helper list
+        // accumulated from every config file, so no helper can prompt, open a
+        // keychain dialog, or hand a token to an unattended fetch.
+        entries.push(("credential.helper", ""));
+    }
+    entries.extend([
+        ("core.fsmonitor", "false"),
+        ("core.sshCommand", "ssh"),
+        ("protocol.ext.allow", "never"),
+    ]);
+    command.env("GIT_CONFIG_COUNT", entries.len().to_string());
+    for (index, (key, value)) in entries.iter().enumerate() {
+        command
+            .env(format!("GIT_CONFIG_KEY_{index}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+    }
     command
 }
 
 fn git(dir: &str, args: &[&str]) -> bool {
-    match maintenance_git_command()
-        .env("GIT_CONFIG_VALUE_4", "never")
+    git_with(dir, args, false)
+}
+
+// Only the phases that talk to a remote (fetch, lfs prune) pass `true`; local
+// phases never need a credential and keep the helper reset.
+fn git_with(dir: &str, args: &[&str], credential_helpers: bool) -> bool {
+    match maintenance_git_command(credential_helpers)
         .args(args)
         .current_dir(dir)
         .stdout(Stdio::null())
@@ -549,13 +564,17 @@ fn has_lfs(dir: &str) -> bool {
 
 // ── cleanup phases ────────────────────────────────────────────────────────────
 
-fn phase_fetch(dir: &str, prune_tags: bool) -> bool {
+fn phase_fetch(dir: &str, prune_tags: bool, credential_helpers: bool) -> bool {
     // --prune-tags removes local tags absent from the remote — including tags
     // the user created and never pushed — so it stays opt-in.
     if prune_tags {
-        git(dir, &["fetch", "--all", "--prune", "--prune-tags"])
+        git_with(
+            dir,
+            &["fetch", "--all", "--prune", "--prune-tags"],
+            credential_helpers,
+        )
     } else {
-        git(dir, &["fetch", "--all", "--prune"])
+        git_with(dir, &["fetch", "--all", "--prune"], credential_helpers)
     }
 }
 
@@ -872,10 +891,10 @@ fn phase_submodules(dir: &str) -> bool {
     )
 }
 
-fn phase_lfs(dir: &str) -> bool {
+fn phase_lfs(dir: &str, credential_helpers: bool) -> bool {
     // Route through git's exec-path so git-lfs is resolved the same way the
     // user's shell would find it (handles PATH-independent Nix setups)
-    git(dir, &["lfs", "prune"])
+    git_with(dir, &["lfs", "prune"], credential_helpers)
 }
 
 // ── per-repo cleanup orchestration ───────────────────────────────────────────
@@ -940,7 +959,7 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
         return true;
     }
 
-    let ok = phase_fetch(dir, opts.prune_tags)
+    let ok = phase_fetch(dir, opts.prune_tags, opts.credential_helpers)
         & phase_refs(dir, repo.kind, &opts.reflog_expire)
         & if opts.prune_worktrees {
             phase_worktrees(dir, &opts.protected_branches)
@@ -967,7 +986,7 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
     };
 
     let ok = if !opts.skip_lfs && has_lfs(dir) {
-        ok & phase_lfs(dir)
+        ok & phase_lfs(dir, opts.credential_helpers)
     } else {
         ok
     };
@@ -1145,9 +1164,10 @@ Environment variables:
   MAINTENANCE_PRUNE_BRANCHES     true → delete merged local branches (non-bare only)
   MAINTENANCE_PRUNE_WORKTREES    true → delete stale worktree dirs (merged into mainline, or idle 3+ days)
   MAINTENANCE_PROTECTED_BRANCHES Comma-separated branch names to protect from deletion
+  MAINTENANCE_CREDENTIAL_HELPERS true → let fetch and lfs prune use the configured credential helpers
 
 Cleanup pipeline (per repo):
-  1. git fetch --all --prune                         (--prune-tags if MAINTENANCE_PRUNE_TAGS)
+  1. git fetch --all --prune                         (--prune-tags if MAINTENANCE_PRUNE_TAGS; helpers if MAINTENANCE_CREDENTIAL_HELPERS)
   2. git pack-refs --all
   3. git worktree prune                              (non-bare only)
   4. git worktree remove -- <stale>                  (if MAINTENANCE_PRUNE_WORKTREES)
@@ -1162,7 +1182,7 @@ Cleanup pipeline (per repo):
      git gc --aggressive --prune=all                (aggressive)
  12. git maintenance run --task=commit-graph
  13. git submodule sync + foreach gc                 (if .gitmodules, non-bare only)
- 14. git lfs prune                                   (if LFS configured)
+ 14. git lfs prune                                   (if LFS configured; helpers if MAINTENANCE_CREDENTIAL_HELPERS)
 "
     )
 }
@@ -1840,6 +1860,7 @@ mod tests {
             "MAINTENANCE_PRUNE_TAGS",
             "MAINTENANCE_PRUNE_BRANCHES",
             "MAINTENANCE_PROTECTED_BRANCHES",
+            "MAINTENANCE_CREDENTIAL_HELPERS",
         ] {
             assert!(text.contains(var), "help text missing env var {var}");
         }
@@ -1877,12 +1898,20 @@ mod tests {
 
     #[test]
     fn maintenance_git_command_forces_non_executable_repository_config() {
-        let command = maintenance_git_command();
+        let command = maintenance_git_command(false);
         let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
 
         assert_eq!(
             envs.get(std::ffi::OsStr::new("GIT_CONFIG_COUNT")),
             Some(&Some(std::ffi::OsStr::new("5")))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_KEY_1")),
+            Some(&Some(std::ffi::OsStr::new("credential.helper")))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_VALUE_1")),
+            Some(&Some(std::ffi::OsStr::new("")))
         );
         assert_eq!(
             envs.get(std::ffi::OsStr::new("GIT_CONFIG_KEY_3")),
@@ -1899,6 +1928,43 @@ mod tests {
         assert_eq!(
             envs.get(std::ffi::OsStr::new("GIT_CONFIG_VALUE_4")),
             Some(&Some(std::ffi::OsStr::new("never")))
+        );
+    }
+
+    #[test]
+    fn maintenance_git_command_with_credential_helpers_keeps_configured_helpers() {
+        let command = maintenance_git_command(true);
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_COUNT")),
+            Some(&Some(std::ffi::OsStr::new("4")))
+        );
+        assert!(
+            !envs
+                .values()
+                .any(|value| *value == Some(std::ffi::OsStr::new("credential.helper"))),
+            "credential.helper must not be reset when helpers are allowed"
+        );
+        for (index, key, value) in [
+            (0, "core.hooksPath", "/dev/null"),
+            (1, "core.fsmonitor", "false"),
+            (2, "core.sshCommand", "ssh"),
+            (3, "protocol.ext.allow", "never"),
+        ] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(&format!("GIT_CONFIG_KEY_{index}"))),
+                Some(&Some(std::ffi::OsStr::new(key)))
+            );
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(&format!("GIT_CONFIG_VALUE_{index}"))),
+                Some(&Some(std::ffi::OsStr::new(value)))
+            );
+        }
+        assert!(!envs.contains_key(std::ffi::OsStr::new("GIT_CONFIG_KEY_4")));
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_TERMINAL_PROMPT")),
+            Some(&Some(std::ffi::OsStr::new("0")))
         );
     }
 
@@ -1926,8 +1992,9 @@ mod tests {
     #[test]
     fn phase_fetch_on_repo_without_remotes_succeeds() {
         let tmp = make_temp_git_repo("phase_fetch");
-        assert!(phase_fetch(tmp.to_str().unwrap(), false));
-        assert!(phase_fetch(tmp.to_str().unwrap(), true));
+        assert!(phase_fetch(tmp.to_str().unwrap(), false, false));
+        assert!(phase_fetch(tmp.to_str().unwrap(), true, false));
+        assert!(phase_fetch(tmp.to_str().unwrap(), false, true));
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1989,7 +2056,7 @@ mod tests {
     #[test]
     fn phase_lfs_on_repo_without_lfs_does_not_panic() {
         let tmp = make_temp_git_repo("phase_lfs");
-        let _ = phase_lfs(tmp.to_str().unwrap());
+        let _ = phase_lfs(tmp.to_str().unwrap(), false);
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -2269,6 +2336,25 @@ mod tests {
         let cfg = make_config(&[("MAINTENANCE_PRUNE_WORKTREES", "true")]);
         let opts = CleanOptions::from_config(&cfg);
         assert!(opts.prune_worktrees);
+    }
+
+    #[test]
+    fn config_credential_helpers_defaults_false() {
+        let cfg = make_config(&[]);
+        assert!(!cfg.credential_helpers);
+    }
+
+    #[test]
+    fn config_credential_helpers_enabled() {
+        let cfg = make_config(&[("MAINTENANCE_CREDENTIAL_HELPERS", "true")]);
+        assert!(cfg.credential_helpers);
+    }
+
+    #[test]
+    fn clean_options_mirrors_credential_helpers_field() {
+        let cfg = make_config(&[("MAINTENANCE_CREDENTIAL_HELPERS", "true")]);
+        let opts = CleanOptions::from_config(&cfg);
+        assert!(opts.credential_helpers);
     }
 
     // ── detect_mainline ──────────────────────────────────────────────────────
@@ -2583,6 +2669,15 @@ mod tests {
         assert!(
             text.contains("MAINTENANCE_PRUNE_WORKTREES"),
             "help text missing MAINTENANCE_PRUNE_WORKTREES"
+        );
+    }
+
+    #[test]
+    fn help_text_contains_credential_helpers_env_var() {
+        let text = help_text("git-bulk-clean");
+        assert!(
+            text.contains("MAINTENANCE_CREDENTIAL_HELPERS"),
+            "help text missing MAINTENANCE_CREDENTIAL_HELPERS"
         );
     }
 

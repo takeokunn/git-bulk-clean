@@ -124,6 +124,14 @@ user or by untrusted automation.
 	_MAINTENANCE_PRUNE_BRANCHES=true_. The detected mainline branch is
 	always protected regardless of this setting. Default: _(empty)_.
 
+*MAINTENANCE_CREDENTIAL_HELPERS*
+	Set to _true_ to let _git fetch_ and _git lfs prune_ use the credential
+	helpers configured in git config, so HTTPS remotes that require
+	authentication can be maintained unattended. When _false_, every helper
+	is reset for the duration of each maintenance command and such remotes
+	fail to fetch. Terminal prompts stay disabled either way. Default:
+	_false_.
+
 # CLEANUP PIPELINE
 
 Each repository is processed through the following phases in order. All
@@ -131,7 +139,7 @@ phases are attempted even if an earlier one fails — errors are logged and
 the repository is counted as failed, but processing continues with the
 remaining phases and repositories.
 
-. *git fetch --all --prune* — fetch from all remotes, removing stale remote-tracking branches. Adds _--prune-tags_ when _MAINTENANCE_PRUNE_TAGS=true_.
+. *git fetch --all --prune* — fetch from all remotes, removing stale remote-tracking branches. Adds _--prune-tags_ when _MAINTENANCE_PRUNE_TAGS=true_. Uses the configured credential helpers only when _MAINTENANCE_CREDENTIAL_HELPERS=true_.
 . *git pack-refs --all* — pack loose reference files into a single packed-refs file.
 . *git worktree prune* — remove stale worktree administrative files. Skipped for bare repositories.
 . *git reflog expire --expire=<MAINTENANCE_REFLOG_EXPIRE> --all* — expire old reflog entries according to the configured cutoff.
@@ -143,7 +151,7 @@ remaining phases and repositories.
 . *git gc --auto* (normal) or *git gc --aggressive --prune=all* (aggressive) — run garbage collection.
 . *git maintenance run --task=commit-graph* — write or update the commit-graph file for faster graph traversal.
 . *git submodule sync --recursive* and *git submodule foreach git gc --auto* — synchronise submodule URLs and compact their object stores. Skipped when _.gitmodules_ is absent, the repository is bare, or _MAINTENANCE_SKIP_SUBMODULES=true_.
-. *git lfs prune* — remove locally cached LFS objects that are no longer referenced. Skipped when _filter.lfs_ is not configured or _MAINTENANCE_SKIP_LFS=true_.
+. *git lfs prune* — remove locally cached LFS objects that are no longer referenced. Skipped when _filter.lfs_ is not configured or _MAINTENANCE_SKIP_LFS=true_. Uses the configured credential helpers only when _MAINTENANCE_CREDENTIAL_HELPERS=true_.
 
 # EXIT STATUS
 
@@ -168,7 +176,11 @@ Dry-run prevents maintenance commands from changing repositories, but it is
 not a sandbox: Git is still invoked for read-only repository, mainline, and LFS
 detection, the filesystem is checked for submodule metadata, and repository-local
 configuration may select helper programs. Do not target
-shared, other-user-writable, or otherwise untrusted repositories. See the
+shared, other-user-writable, or otherwise untrusted repositories. With
+_MAINTENANCE_CREDENTIAL_HELPERS=true_, each repository's git config also
+selects the credential helper that runs during fetch and LFS prune, and a
+helper value beginning with *!* is executed as a shell command, so enable
+it only for repositories whose configuration you control. See the
 project's SECURITY.md for vulnerability reporting and supported versions.
 
 # EXAMPLES
