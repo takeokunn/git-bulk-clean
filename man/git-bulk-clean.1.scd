@@ -119,10 +119,20 @@ user or by untrusted automation.
 	branch and branches checked out in other worktrees are never deleted.
 	Only runs on non-bare repositories. Default: _false_.
 
+*MAINTENANCE_PRUNE_WORKTREES*
+	Set to _true_ to delete linked worktree directories whose checked-out
+	commit is merged into the mainline, or whose last commit is more than
+	three days old. The primary worktree is never a candidate, and a
+	worktree checked out to a branch listed in
+	_MAINTENANCE_PROTECTED_BRANCHES_ is skipped. Never passes _--force_,
+	so a worktree with uncommitted changes is left alone by git itself.
+	Default: _false_.
+
 *MAINTENANCE_PROTECTED_BRANCHES*
 	Comma-separated list of branch names to never delete, even when
-	_MAINTENANCE_PRUNE_BRANCHES=true_. The detected mainline branch is
-	always protected regardless of this setting. Default: _(empty)_.
+	_MAINTENANCE_PRUNE_BRANCHES=true_, and whose worktrees are never
+	removed by _MAINTENANCE_PRUNE_WORKTREES_. The detected mainline branch
+	is always protected regardless of this setting. Default: _(empty)_.
 
 *MAINTENANCE_CREDENTIAL_HELPERS*
 	Set to _true_ to let _git fetch_ and _git lfs prune_ use the credential
@@ -142,6 +152,7 @@ remaining phases and repositories.
 . *git fetch --all --prune* — fetch from all remotes, removing stale remote-tracking branches. Adds _--prune-tags_ when _MAINTENANCE_PRUNE_TAGS=true_. Uses the configured credential helpers only when _MAINTENANCE_CREDENTIAL_HELPERS=true_.
 . *git pack-refs --all* — pack loose reference files into a single packed-refs file.
 . *git worktree prune* — remove stale worktree administrative files. Skipped for bare repositories.
+. *git worktree remove -- <stale>* — delete worktree directories merged into the mainline or idle for three days. Only runs when _MAINTENANCE_PRUNE_WORKTREES=true_.
 . *git reflog expire --expire=<MAINTENANCE_REFLOG_EXPIRE> --all* — expire old reflog entries according to the configured cutoff.
 . *git rerere gc* — clean up stale conflict-resolution records from the rerere cache. Always runs; no-op on repositories that do not use rerere.
 . *git notes prune* — remove note refs whose annotated objects no longer exist. Always runs.

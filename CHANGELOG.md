@@ -6,12 +6,14 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-11
+
 ### Added
 
-- Added `MAINTENANCE_PRUNE_WORKTREES`: when enabled, deletes worktree
-  directories that are fully merged into the mainline or idle for more than
-  three days, skipping any worktree whose checked-out branch is in
-  `MAINTENANCE_PROTECTED_BRANCHES`.
+- Added `MAINTENANCE_PRUNE_WORKTREES` (Home Manager: `pruneWorktrees`): when
+  enabled, deletes worktree directories that are fully merged into the
+  mainline or idle for more than three days, skipping any worktree whose
+  checked-out branch is in `MAINTENANCE_PROTECTED_BRANCHES`.
 - Added `MAINTENANCE_CREDENTIAL_HELPERS` (Home Manager: `credentialHelpers`):
   when enabled, `git fetch` and `git lfs prune` use the credential helpers
   from git config instead of running with every helper reset, so HTTPS
@@ -86,7 +88,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Consolidated formatting, linting, build, and test validation under
   `nix flake check` and fixed issues exposed by that gate.
 
-[Unreleased]: https://github.com/takeokunn/git-bulk-clean/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/takeokunn/git-bulk-clean/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/takeokunn/git-bulk-clean/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/takeokunn/git-bulk-clean/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/takeokunn/git-bulk-clean/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/takeokunn/git-bulk-clean/compare/v0.2.0...v0.3.0

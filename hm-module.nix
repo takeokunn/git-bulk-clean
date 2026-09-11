@@ -20,6 +20,7 @@ let
     MAINTENANCE_SKIP_LFS = boolToStr cfg.skipLfs;
     MAINTENANCE_PRUNE_TAGS = boolToStr cfg.pruneTags;
     MAINTENANCE_PRUNE_BRANCHES = boolToStr cfg.pruneBranches;
+    MAINTENANCE_PRUNE_WORKTREES = boolToStr cfg.pruneWorktrees;
     MAINTENANCE_PROTECTED_BRANCHES = lib.concatStringsSep "," cfg.protectedBranches;
     MAINTENANCE_CREDENTIAL_HELPERS = boolToStr cfg.credentialHelpers;
   };
@@ -98,6 +99,16 @@ in
       type = lib.types.bool;
       default = false;
       description = "Delete local branches that have been merged into the mainline (non-bare only)";
+    };
+
+    pruneWorktrees = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Delete worktree directories whose checkout is merged into the
+        mainline or has had no commit for three days. A worktree checked
+        out to a branch in protectedBranches is never deleted.
+      '';
     };
 
     protectedBranches = lib.mkOption {
