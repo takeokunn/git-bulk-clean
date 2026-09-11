@@ -1,10 +1,18 @@
 //! git-bulk-clean — parallel Git repository maintenance CLI/daemon.
 //!
-//! Built entirely on the standard library. The code favours making illegal
-//! states unrepresentable: repository kinds, target shells, and the worker
-//! count are modelled as dedicated types rather than raw `bool`/`String`/`usize`.
+//! Built entirely on the standard library, no dependency crate. The code
+//! favours making illegal states unrepresentable: repository kinds, target
+//! shells, and the worker count are modelled as dedicated types rather than
+//! raw `bool`/`String`/`usize`. Unsafe code is denied everywhere except one
+//! narrow, audited FFI island in "── signal handling ──" that calls libc
+//! directly to stop child processes on SIGTERM/SIGINT.
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: forbid cannot be overridden by any inner `allow`, and
+// stopping child processes on SIGTERM/SIGINT needs a narrow, explicitly
+// audited FFI island (see "── signal handling ──") to call libc's signal,
+// kill, setpgid, and _exit. Everywhere else in the crate, unsafe code is
+// still a hard compile error.
+#![deny(unsafe_code)]
 
 use std::collections::HashSet;
 use std::env;
@@ -29,7 +37,7 @@ const MAX_WORKERS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 // into the mainline, is a stale-worktree deletion candidate.
 const WORKTREE_IDLE_THRESHOLD_SECS: u64 = 3 * 24 * 60 * 60;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DANGEROUS_GIT_ENV: [&str; 14] = [
+const DANGEROUS_GIT_ENV: [&str; 30] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -40,10 +48,41 @@ const DANGEROUS_GIT_ENV: [&str; 14] = [
     "GIT_EXEC_PATH",
     "GIT_SSH",
     "GIT_SSH_COMMAND",
+    // Shapes the arguments passed to whatever SSH command is configured
+    // (OpenSSH vs. plink/tortoiseplink flag conventions); left set, it can
+    // make git reinterpret the plain "ssh" invocation forced by
+    // core.sshCommand=ssh above as a different variant's argument syntax.
+    "GIT_SSH_VARIANT",
+    // core.gitProxy routes all network traffic through an arbitrary command.
+    // Per git-config(1), GIT_PROXY_COMMAND overrides that config setting
+    // unconditionally — unlike credential.helper, there is no config layer
+    // that can neutralize it, only env_remove.
+    "GIT_PROXY_COMMAND",
+    // GIT_TERMINAL_PROMPT=0 (set below) only suppresses the terminal fallback;
+    // an inherited askpass program still runs and can hand a credential to an
+    // unattended fetch, so all three askpass vectors are stripped alongside it.
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
     "GIT_CEILING_DIRECTORIES",
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
+    // The GIT_TRACE* family writes protocol dumps, packet contents, and
+    // pack-access logs to a file path taken directly from the environment;
+    // a parent-controlled path can exfiltrate credential-bearing transport
+    // data or overwrite an arbitrary file the process can write to.
+    "GIT_TRACE",
+    "GIT_TRACE2",
+    "GIT_TRACE2_EVENT",
+    "GIT_TRACE2_PERF",
+    "GIT_TRACE_CURL",
+    "GIT_TRACE_CURL_NO_DATA",
+    "GIT_TRACE_PACKET",
+    "GIT_TRACE_PACK_ACCESS",
+    "GIT_TRACE_PERFORMANCE",
+    "GIT_TRACE_SETUP",
+    "GIT_TRACE_SHALLOW",
 ];
 
 // ── target shells ─────────────────────────────────────────────────────────────
@@ -380,10 +419,9 @@ fn probe_repo(dir: &str) -> Option<(RepoKind, String, String)> {
     }
     let canonical_path = canonical_path.to_string_lossy().into_owned();
 
-    hardened_git_command()
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+    let mut command = hardened_git_command();
+    with_git_config(&mut command, &[("core.hooksPath", "/dev/null")]);
+    command
         .args([
             "rev-parse",
             "--is-bare-repository",
@@ -479,6 +517,17 @@ fn hardened_git_command() -> Command {
     command
 }
 
+// Renders `entries` as the GIT_CONFIG_COUNT/KEY_n/VALUE_n triples git reads
+// as its highest-priority config layer, overriding every file-based source.
+fn with_git_config(command: &mut Command, entries: &[(&str, &str)]) {
+    command.env("GIT_CONFIG_COUNT", entries.len().to_string());
+    for (index, (key, value)) in entries.iter().enumerate() {
+        command
+            .env(format!("GIT_CONFIG_KEY_{index}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+    }
+}
+
 fn maintenance_git_command(credential_helpers: bool) -> Command {
     let mut command = hardened_git_command();
     let mut entries = vec![("core.hooksPath", "/dev/null")];
@@ -493,12 +542,7 @@ fn maintenance_git_command(credential_helpers: bool) -> Command {
         ("core.sshCommand", "ssh"),
         ("protocol.ext.allow", "never"),
     ]);
-    command.env("GIT_CONFIG_COUNT", entries.len().to_string());
-    for (index, (key, value)) in entries.iter().enumerate() {
-        command
-            .env(format!("GIT_CONFIG_KEY_{index}"), key)
-            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
-    }
+    with_git_config(&mut command, &entries);
     command
 }
 
@@ -549,10 +593,9 @@ fn has_submodules(dir: &str) -> bool {
 
 fn has_lfs(dir: &str) -> bool {
     // filter.lfs.clean is set iff git-lfs was ever initialised in this repo
-    hardened_git_command()
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+    let mut command = hardened_git_command();
+    with_git_config(&mut command, &[("core.hooksPath", "/dev/null")]);
+    command
         .args(["config", "--local", "--get-regexp", "filter\\.lfs\\."])
         .current_dir(dir)
         .stdout(Stdio::null())
@@ -601,10 +644,9 @@ fn phase_refs(dir: &str, kind: RepoKind, reflog_expire: &str) -> bool {
 
 fn local_branch_exists(dir: &str, name: &str) -> bool {
     // Fully qualified so a tag with the same name cannot shadow the branch
-    hardened_git_command()
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+    let mut command = hardened_git_command();
+    with_git_config(&mut command, &[("core.hooksPath", "/dev/null")]);
+    command
         .args([
             "rev-parse",
             "--verify",
@@ -623,10 +665,9 @@ fn local_branch_exists(dir: &str, name: &str) -> bool {
 // then instead of failing every cycle against a nonexistent branch.
 fn detect_mainline(dir: &str) -> Option<String> {
     // Try origin's default branch via symbolic-ref (e.g. "origin/main" → "main")
-    let out = hardened_git_command()
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+    let mut command = hardened_git_command();
+    with_git_config(&mut command, &[("core.hooksPath", "/dev/null")]);
+    let out = command
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .current_dir(dir)
         .stdout(Stdio::piped())
@@ -661,14 +702,10 @@ fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
         ));
         return true;
     };
-    let out = hardened_git_command()
-        .env("GIT_CONFIG_COUNT", "3")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
-        .env("GIT_CONFIG_KEY_1", "credential.helper")
-        .env("GIT_CONFIG_VALUE_1", "")
-        .env("GIT_CONFIG_KEY_2", "core.fsmonitor")
-        .env("GIT_CONFIG_VALUE_2", "false")
+    // `false`: local branch listing never talks to a remote, but using the
+    // same fully hardened command as fetch/push removes the divergence
+    // between "read-only local" and "remote-touching" git invocations.
+    let out = maintenance_git_command(false)
         .args(["branch", "--merged", &mainline])
         .current_dir(dir)
         .stdout(Stdio::piped())
@@ -727,10 +764,9 @@ fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
 // repository itself, for a bare repo — first; it must never be a removal
 // candidate). Each entry is (absolute path, checked-out local branch name).
 fn list_secondary_worktrees(dir: &str) -> Vec<(String, Option<String>)> {
-    let output = hardened_git_command()
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+    let mut command = hardened_git_command();
+    with_git_config(&mut command, &[("core.hooksPath", "/dev/null")]);
+    let output = command
         .args(["worktree", "list", "--porcelain"])
         .current_dir(dir)
         .stdout(Stdio::piped())
@@ -765,10 +801,9 @@ fn list_secondary_worktrees(dir: &str) -> Vec<(String, Option<String>)> {
 }
 
 fn worktree_is_merged(wt: &str, mainline: &str) -> bool {
-    hardened_git_command()
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+    let mut command = hardened_git_command();
+    with_git_config(&mut command, &[("core.hooksPath", "/dev/null")]);
+    command
         .args(["merge-base", "--is-ancestor", "HEAD", mainline])
         .current_dir(wt)
         .stdout(Stdio::null())
@@ -781,10 +816,9 @@ fn worktree_is_merged(wt: &str, mainline: &str) -> bool {
 // A worktree with no reachable commit (an unborn HEAD) is never idle — an
 // unparseable timestamp must not be mistaken for staleness.
 fn worktree_is_idle(wt: &str) -> bool {
-    let output = hardened_git_command()
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+    let mut command = hardened_git_command();
+    with_git_config(&mut command, &[("core.hooksPath", "/dev/null")]);
+    let output = command
         .args(["log", "-1", "--format=%ct", "HEAD"])
         .current_dir(wt)
         .stdout(Stdio::piped())
@@ -1092,6 +1126,81 @@ fn run_cycle(cfg: &Config, dry_run: bool) -> CycleStats {
     CycleStats { failed }
 }
 
+// ── signal handling ─────────────────────────────────────────────────────────
+
+// Without this, a SIGTERM/SIGINT sent to this process alone leaves whatever
+// `git` child it spawned (fetch, gc, ...) running to completion, orphaned
+// once the parent daemon has exited. `signal`, not `sigaction`, so no
+// per-platform siginfo/sigset_t struct layout needs to be hand-declared here;
+// the values of SIGINT and SIGTERM are identical on Linux and Darwin. The
+// bare `signal` symbol — not a <signal.h> macro — has BSD-reliable semantics
+// on both glibc and Darwin's libc: the handler stays installed after firing
+// (no need to reinstall inside handle_termination), the signal being handled
+// is blocked for the duration of its own handler, and slow syscalls restart
+// (SA_RESTART) rather than failing with EINTR.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+unsafe extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn setpgid(pid: i32, pgid: i32) -> i32;
+    fn _exit(status: i32) -> !;
+}
+
+#[cfg(unix)]
+const SIGINT: i32 = 2;
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+
+// Only async-signal-safe operations belong in this function: no allocation,
+// no formatting, no std::process::exit (which runs Rust's own cleanup and
+// can deadlock if the signal interrupted that same cleanup elsewhere).
+#[cfg(unix)]
+extern "C" fn handle_termination(sig: i32) {
+    #[allow(unsafe_code)]
+    unsafe {
+        // pid 0 means "every process in the caller's own process group" —
+        // see install_signal_handlers for why this process has one to itself.
+        kill(0, SIGTERM);
+        _exit(128 + sig);
+    }
+}
+
+#[cfg(unix)]
+fn install_signal_handlers() {
+    // An interactive `cargo run` sits in the terminal's own process group,
+    // so Ctrl-C already reaches this process and every child it spawned
+    // directly, without any of the code below. Moving to a new group removes
+    // that shortcut: from here on this process receives only an explicit
+    // kill, which matches the production target, where there is no
+    // controlling terminal to send Ctrl-C from in the first place.
+    //
+    // A non-zero return here is expected, not a bug, when this process is
+    // already a session leader (e.g. some service supervisors start it that
+    // way): a session leader already has pid == pgid, which is the property
+    // setpgid(0, 0) exists to establish, so setpgid fails with EPERM but the
+    // goal already holds. Any other failure just means SIGTERM forwarding
+    // below is best-effort rather than guaranteed — the handlers are still
+    // installed either way.
+    #[allow(unsafe_code)]
+    let setpgid_result = unsafe { setpgid(0, 0) };
+    if setpgid_result != 0 {
+        log(
+            "could not move into a new process group; SIGTERM forwarding to child processes on exit is best-effort",
+        );
+    }
+
+    #[allow(unsafe_code)]
+    unsafe {
+        let handler = handle_termination as *const () as usize;
+        signal(SIGINT, handler);
+        signal(SIGTERM, handler);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
+
 // ── cli ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1194,6 +1303,8 @@ fn print_help(prog: &str) {
 }
 
 fn main() {
+    install_signal_handlers();
+
     let args: Vec<String> = env::args().collect();
     let prog = args.first().map(String::as_str).unwrap_or("git-bulk-clean");
     let flags: &[String] = args.get(1..).unwrap_or_default();
@@ -1473,7 +1584,7 @@ mod tests {
     #[test]
     fn probe_repo_non_repo_returns_none() {
         // Create a temp dir that is not a git repo
-        let tmp = env::temp_dir().join("git_bulk_clean_nonrepo_test");
+        let tmp = unique_temp_dir("nonrepo_test");
         let _ = fs::create_dir_all(&tmp);
         let kind = probe_repo(tmp.to_str().unwrap());
         assert!(
@@ -1499,7 +1610,7 @@ mod tests {
 
     #[test]
     fn has_submodules_detects_gitmodules() {
-        let tmp = env::temp_dir().join("git_bulk_clean_submodule_test");
+        let tmp = unique_temp_dir("submodule_test");
         let _ = fs::create_dir_all(&tmp);
         assert!(!has_submodules(tmp.to_str().unwrap()));
         fs::write(tmp.join(".gitmodules"), "[submodule]\n").unwrap();
@@ -1579,21 +1690,58 @@ mod tests {
         assert_eq!(format_timestamp(3661), "01:01:01");
     }
 
+    #[test]
+    fn unique_temp_dir_path_embeds_process_id() {
+        let path = unique_temp_dir("pid_check");
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "temp dir name {name:?} does not embed this process's id — two \
+             concurrently running test binaries could compute the same path \
+             and corrupt each other's fixtures"
+        );
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    fn make_temp_git_repo(name: &str) -> std::path::PathBuf {
+    // A bare atomic counter is only unique within this process; two test
+    // binaries invoked concurrently (or a stray leftover process) both start
+    // counting at zero and land on the same path under the shared $TMPDIR.
+    // Mixing in the process id closes that cross-process collision.
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = env::temp_dir().join(format!("git_bulk_clean_{}_{}", name, id));
+        env::temp_dir().join(format!(
+            "git_bulk_clean_{}_{}_{}",
+            label,
+            std::process::id(),
+            id
+        ))
+    }
+
+    // Overrides the two global-config settings that would otherwise make test
+    // setup depend on the developer's machine: a hooksPath pointing at a
+    // scanner (e.g. gitleaks) that runs on every commit, and commit signing,
+    // which fails outright without a configured key.
+    const NO_HOOKS_NO_SIGN: [&str; 4] = [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "commit.gpgsign=false",
+    ];
+
+    fn make_temp_git_repo(name: &str) -> std::path::PathBuf {
+        let tmp = unique_temp_dir(name);
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         Command::new("git")
-            .args(["init"])
+            .args(NO_HOOKS_NO_SIGN)
+            .arg("init")
             .current_dir(&tmp)
             .output()
             .unwrap();
@@ -1614,6 +1762,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
+            .args(NO_HOOKS_NO_SIGN)
             .args(["commit", "-m", "init"])
             .current_dir(&tmp)
             .output()
@@ -1968,6 +2117,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn with_git_config_sets_count_and_every_pair() {
+        let mut command = Command::new("git");
+        with_git_config(&mut command, &[("a.b", "1"), ("c.d", "2")]);
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_COUNT")),
+            Some(&Some(std::ffi::OsStr::new("2")))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_KEY_0")),
+            Some(&Some(std::ffi::OsStr::new("a.b")))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_VALUE_0")),
+            Some(&Some(std::ffi::OsStr::new("1")))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_KEY_1")),
+            Some(&Some(std::ffi::OsStr::new("c.d")))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_VALUE_1")),
+            Some(&Some(std::ffi::OsStr::new("2")))
+        );
+    }
+
+    #[test]
+    fn with_git_config_empty_entries_sets_count_zero() {
+        let mut command = Command::new("git");
+        with_git_config(&mut command, &[]);
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GIT_CONFIG_COUNT")),
+            Some(&Some(std::ffi::OsStr::new("0")))
+        );
+        assert!(!envs.contains_key(std::ffi::OsStr::new("GIT_CONFIG_KEY_0")));
+    }
+
     // ── has_lfs ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -2018,7 +2208,7 @@ mod tests {
 
     #[test]
     fn phase_objects_normal_on_empty_repo_succeeds() {
-        let tmp = env::temp_dir().join("git_bulk_clean_empty_normal");
+        let tmp = unique_temp_dir("empty_normal");
         let _ = fs::remove_dir_all(&tmp);
         assert!(
             Command::new("git")
@@ -2107,7 +2297,7 @@ mod tests {
 
     #[test]
     fn clean_repo_live_on_empty_bare_repo_succeeds() {
-        let tmp = env::temp_dir().join("git_bulk_clean_empty_bare");
+        let tmp = unique_temp_dir("empty_bare");
         let _ = fs::remove_dir_all(&tmp);
         assert!(
             Command::new("git")
@@ -2361,10 +2551,7 @@ mod tests {
 
     #[test]
     fn detect_mainline_falls_back_to_master_when_no_main() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let id = SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = env::temp_dir().join(format!("git_bulk_clean_mainline_master_{}", id));
+        let tmp = unique_temp_dir("mainline_master");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         // Force "master" so this test is unconditional regardless of init.defaultBranch
@@ -2390,6 +2577,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
+            .args(NO_HOOKS_NO_SIGN)
             .args(["commit", "-m", "init"])
             .current_dir(&tmp)
             .output()
@@ -2403,10 +2591,7 @@ mod tests {
 
     #[test]
     fn detect_mainline_none_when_no_main_or_master() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let id = SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = env::temp_dir().join(format!("git_bulk_clean_mainline_none_{}", id));
+        let tmp = unique_temp_dir("mainline_none");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         Command::new("git")
@@ -2422,10 +2607,7 @@ mod tests {
 
     #[test]
     fn detect_mainline_falls_back_to_main_when_main_exists() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let id = SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = env::temp_dir().join(format!("git_bulk_clean_mainline_main_{}", id));
+        let tmp = unique_temp_dir("mainline_main");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         // Force "main" so there is no origin/HEAD but "main" exists locally
@@ -2451,6 +2633,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
+            .args(NO_HOOKS_NO_SIGN)
             .args(["commit", "-m", "init"])
             .current_dir(&tmp)
             .output()
@@ -2491,6 +2674,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
+            .args(NO_HOOKS_NO_SIGN)
             .args(["commit", "-m", "feature"])
             .current_dir(dir)
             .output()
@@ -2501,6 +2685,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
+            .args(NO_HOOKS_NO_SIGN)
             .args(["merge", "feature/x", "--no-ff", "-m", "merge"])
             .current_dir(dir)
             .output()
@@ -2540,6 +2725,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
+            .args(NO_HOOKS_NO_SIGN)
             .args(["commit", "-m", "p"])
             .current_dir(dir)
             .output()
@@ -2550,6 +2736,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
+            .args(NO_HOOKS_NO_SIGN)
             .args(["merge", "protected-branch", "--no-ff", "-m", "merge"])
             .current_dir(dir)
             .output()
@@ -2616,6 +2803,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
+            .args(NO_HOOKS_NO_SIGN)
             .args(["commit", "-m", "c"])
             .current_dir(dir)
             .output()
@@ -2626,6 +2814,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
+            .args(NO_HOOKS_NO_SIGN)
             .args(["merge", "feature/current", "--no-ff", "-m", "merge"])
             .current_dir(dir)
             .output()
@@ -2775,6 +2964,7 @@ mod tests {
         );
         assert!(
             Command::new("git")
+                .args(NO_HOOKS_NO_SIGN)
                 .args(["commit", "-m", "unmerged work"])
                 .current_dir(&linked)
                 .status()
@@ -2828,7 +3018,7 @@ mod tests {
 
     #[test]
     fn worktree_is_idle_false_on_unborn_head() {
-        let tmp = env::temp_dir().join("git_bulk_clean_worktree_idle_unborn");
+        let tmp = unique_temp_dir("worktree_idle_unborn");
         let _ = fs::remove_dir_all(&tmp);
         assert!(
             Command::new("git")

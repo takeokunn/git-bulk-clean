@@ -1,9 +1,9 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_git-bulk-clean"))
@@ -35,6 +35,14 @@ fn temp_repo() -> PathBuf {
     let path = create_temp_dir("repo");
     assert!(
         Command::new("git")
+            // Overrides the developer's global hooksPath/signing config so
+            // setup does not depend on what is installed on this machine.
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
             .arg("init")
             .current_dir(&path)
             .status()
@@ -83,6 +91,26 @@ fn git_stub(dir: &Path, real_git: &Path, log: &Path) {
             "#!/bin/sh\n{{\n  printf '%s\\n' \"$*\"\n  env | grep '^GIT_CONFIG_'\n  printf -- '---\\n'\n}} >> \"{log}\"\nexec \"{real_git}\" \"$@\"\n",
             log = log.display(),
             real_git = real_git.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+// A git stub that never execs the real binary: it records its own pid to
+// `marker` (so the test can tell it has actually started, and later confirm
+// the pid is gone rather than merely that a file was created) and then
+// sleeps, standing in for a long-running `git fetch` the daemon must be able
+// to kill on SIGTERM/SIGINT.
+fn sleeping_git_stub(dir: &Path, marker: &Path) {
+    let path = dir.join("git");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\necho $$ > \"{marker}\"\nexec sleep 30\n",
+            marker = marker.display(),
         ),
     )
     .unwrap();
@@ -318,4 +346,118 @@ fn credential_helpers_env_var_defaults_to_resetting_helper_on_fetch() {
 
     let _ = fs::remove_dir_all(repo);
     let _ = fs::remove_dir_all(stubs);
+}
+
+// Ensures the daemon child and, best-effort, the stub it may have spawned
+// are cleaned up even when an assertion above panics mid-test — otherwise a
+// failing assertion leaks a sleeping `sleep 30` process and two temp
+// directories instead of just failing the one test.
+struct KillOnDrop {
+    child: Child,
+    repo: PathBuf,
+    stubs: PathBuf,
+    marker: PathBuf,
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Ok(contents) = fs::read_to_string(&self.marker) {
+            if let Ok(stub_pid) = contents.trim().parse::<u32>() {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &stub_pid.to_string()])
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+        let _ = fs::remove_dir_all(&self.repo);
+        let _ = fs::remove_dir_all(&self.stubs);
+    }
+}
+
+fn signal_stops_daemon_and_child(signal: &str) {
+    let repo = temp_repo();
+    let stubs = temp_dir("signal_stub");
+    let marker = stubs.join("stub.pid");
+    sleeping_git_stub(&stubs, &marker);
+
+    let child = binary()
+        .env("PATH", path_with(&stubs))
+        .env("MAINTENANCE_REPOS", &repo)
+        .spawn()
+        .unwrap();
+    let daemon_pid = child.id();
+    let mut guard = KillOnDrop {
+        child,
+        repo,
+        stubs,
+        marker: marker.clone(),
+    };
+
+    // Wait for the stub to actually be running before signalling — sending
+    // the signal before the child git process exists would prove nothing
+    // about stopping it.
+    let start_deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(Instant::now() < start_deadline, "git stub never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stub_pid: u32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+
+    assert!(
+        Command::new("kill")
+            .args([signal, &daemon_pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let exit_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if guard.child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "daemon did not exit within 2s of {signal}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // `ps` is not on PATH in the Nix build sandbox (only coreutils and the
+    // package's declared inputs are), so liveness is checked with `kill -0`
+    // instead: it sends no signal, only reports whether the pid still
+    // resolves to a process. A brief window after the daemon's own exit is
+    // expected before the kernel finishes delivering the forwarded SIGTERM
+    // and reparenting/reaping the stub, so this polls for up to 500ms rather
+    // than checking once. `.stderr(null)` suppresses the "No such process"
+    // message `kill -0` prints once the pid is gone, which is the expected
+    // and desired outcome here, not an error.
+    let liveness_deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let still_running = Command::new("kill")
+            .args(["-0", &stub_pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        if !still_running.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < liveness_deadline,
+            "git stub (pid {stub_pid}) is still running 500ms after the daemon exited"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn sigterm_kills_git_child_and_daemon_exits_promptly() {
+    signal_stops_daemon_and_child("-TERM");
+}
+
+#[test]
+fn sigint_kills_git_child_and_daemon_exits_promptly() {
+    signal_stops_daemon_and_child("-INT");
 }

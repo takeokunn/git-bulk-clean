@@ -37,7 +37,7 @@ user or by untrusted automation.
 
 *--daemon*
 	Loop forever, sleeping _MAINTENANCE_INTERVAL_ seconds between cleanup
-	cycles. Send SIGINT or SIGTERM to stop.
+	cycles. Send SIGINT or SIGTERM to stop (see SIGNALS).
 
 *--dry-run*
 	Print repository-changing Git commands without running them. Read-only
@@ -174,6 +174,16 @@ remaining phases and repositories.
 
 *2*
 	The command line contains an invalid option or argument.
+
+# SIGNALS
+
+On startup, git-bulk-clean places itself in its own process group. On
+SIGINT or SIGTERM, it forwards SIGTERM to that whole group — _kill(0,
+SIGTERM)_ — before exiting, so a git child that is mid-fetch or mid-gc when
+the signal arrives is stopped along with the daemon rather than left
+running unattended. Sending SIGTERM to the daemon's own pid is therefore
+enough to stop every git process it spawned; no separate cleanup of child
+processes is needed.
 
 # SECURITY
 
