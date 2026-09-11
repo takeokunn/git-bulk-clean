@@ -157,11 +157,11 @@ Each repository runs through these phases in order. All phases are attempted eve
 
 ### Cargo (from the current release tag)
 
-This project is not published on crates.io. Install the current `v0.6.0`
+This project is not published on crates.io. Install the current `v0.6.1`
 source tag directly from GitHub:
 
 ```sh
-cargo install --git https://github.com/takeokunn/git-bulk-clean --tag v0.6.0 --locked
+cargo install --git https://github.com/takeokunn/git-bulk-clean --tag v0.6.1 --locked
 ```
 
 ### Nix — one-off run

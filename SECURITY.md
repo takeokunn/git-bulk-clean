@@ -3,7 +3,7 @@
 ## Supported versions
 
 The latest released minor line is the supported security-reporting scope. At
-present, that is the `0.4.x` release line. Older releases are unsupported and
+present, that is the `0.6.x` release line. Older releases are unsupported and
 may require upgrading for any available fix. The unreleased `main` branch may
 contain additional fixes but is not a supported release.
 
