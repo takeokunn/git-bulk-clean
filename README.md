@@ -129,7 +129,7 @@ Each repository runs through these phases in order. All phases are attempted eve
 
 | # | Command | When |
 |---|---------|------|
-| 1 | `git fetch --all --prune` (`--prune-tags` added when `MAINTENANCE_PRUNE_TAGS=true`) | always |
+| 1 | `git fetch --all --prune` (`--prune-tags` added when `MAINTENANCE_PRUNE_TAGS=true`; credential helpers only when `MAINTENANCE_CREDENTIAL_HELPERS=true`) | always |
 | 2 | `git pack-refs --all` | always |
 | 3 | `git worktree prune` | non-bare |
 | 4 | `git worktree remove -- <stale>` | `MAINTENANCE_PRUNE_WORKTREES=true` (merged into mainline, or idle 3+ days) |
@@ -144,7 +144,7 @@ Each repository runs through these phases in order. All phases are attempted eve
 | 11 | `git gc --aggressive --prune=all` | aggressive mode |
 | 12 | `git maintenance run --task=commit-graph` | always |
 | 13 | `git submodule sync --recursive` + `foreach git gc --auto` | `.gitmodules` exists, non-bare |
-| 14 | `git lfs prune` | `filter.lfs` configured in repo |
+| 14 | `git lfs prune` (credential helpers only when `MAINTENANCE_CREDENTIAL_HELPERS=true`) | `filter.lfs` configured in repo |
 
 > **Why run `loose-objects` and `incremental-repack` before `gc`?**
 > `git gc --auto` only triggers when internal thresholds are exceeded.
@@ -336,6 +336,7 @@ All configuration is via environment variables — no config file required.
 | `MAINTENANCE_PRUNE_BRANCHES` | `false` | `true` → delete local branches merged into the mainline (non-bare only) |
 | `MAINTENANCE_PRUNE_WORKTREES` | `false` | `true` → delete worktree directories merged into the mainline, or idle for 3+ days |
 | `MAINTENANCE_PROTECTED_BRANCHES` | _(empty)_ | Comma-separated branch names to never delete (mainline is always protected); also skips worktrees checked out to a protected branch |
+| `MAINTENANCE_CREDENTIAL_HELPERS` | `false` | `true` → `git fetch` and `git lfs prune` use the credential helpers from git config, so authenticated HTTPS remotes work unattended. Off: every helper is reset and such remotes fail to fetch |
 
 Paths listed in `MAINTENANCE_REPOS` that do not exist or are not git repositories are silently ignored.
 
@@ -348,6 +349,11 @@ repository whose `.git` directory, configuration, objects, worktrees, or helper
 programs can be modified by another user or by untrusted automation. In
 particular, avoid shared or other-user-writable repositories and repositories
 that configure arbitrary credential, transport, filter, diff, or LFS helpers.
+Credential helpers are reset on every maintenance command unless
+`MAINTENANCE_CREDENTIAL_HELPERS=true`; enabling it lets each repository's
+git config choose which helper program runs during fetch and LFS prune, and
+a helper value beginning with `!` is executed as a shell command, so turn it
+on only for repositories whose configuration you control.
 
 Maintenance changes repository metadata and may permanently remove reflog
 entries, unreachable objects, stale worktree metadata, LFS cache objects, local
@@ -436,6 +442,7 @@ launchd agent through Home Manager.
 | `pruneTags` | `bool` | `false` | Delete local tags missing from the remote (removes unpushed tags too) |
 | `pruneBranches` | `bool` | `false` | Delete merged local branches |
 | `protectedBranches` | `[str]` | `[]` | Branches to never delete |
+| `credentialHelpers` | `bool` | `false` | Let fetch and lfs prune use configured credential helpers |
 
 ---
 

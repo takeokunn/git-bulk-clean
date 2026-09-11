@@ -21,6 +21,7 @@ let
     MAINTENANCE_PRUNE_TAGS = boolToStr cfg.pruneTags;
     MAINTENANCE_PRUNE_BRANCHES = boolToStr cfg.pruneBranches;
     MAINTENANCE_PROTECTED_BRANCHES = lib.concatStringsSep "," cfg.protectedBranches;
+    MAINTENANCE_CREDENTIAL_HELPERS = boolToStr cfg.credentialHelpers;
   };
   # systemd's Environment= word-splits unquoted values, so repo paths with
   # spaces need each KEY=value assignment wrapped in escaped double quotes.
@@ -103,6 +104,18 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
       description = "Branch names to never delete when pruneBranches is enabled (mainline is always protected)";
+    };
+
+    credentialHelpers = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Let git fetch and git lfs prune use the credential helpers configured
+        in git config, so HTTPS remotes that need authentication can be
+        reached unattended. Off by default: every helper is reset so an
+        unattended run can never prompt or hand a token to a repository's
+        own configuration.
+      '';
     };
   };
 

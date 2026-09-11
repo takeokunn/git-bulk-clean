@@ -12,6 +12,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   directories that are fully merged into the mainline or idle for more than
   three days, skipping any worktree whose checked-out branch is in
   `MAINTENANCE_PROTECTED_BRANCHES`.
+- Added `MAINTENANCE_CREDENTIAL_HELPERS` (Home Manager: `credentialHelpers`):
+  when enabled, `git fetch` and `git lfs prune` use the credential helpers
+  from git config instead of running with every helper reset, so HTTPS
+  remotes that require authentication can be maintained unattended. Every
+  other phase keeps the reset.
 
 ## [0.5.0] - 2026-07-26
 
