@@ -157,11 +157,11 @@ Each repository runs through these phases in order. All phases are attempted eve
 
 ### Cargo (from the current release tag)
 
-This project is not published on crates.io. Install the current `v0.4.0`
+This project is not published on crates.io. Install the current `v0.6.0`
 source tag directly from GitHub:
 
 ```sh
-cargo install --git https://github.com/takeokunn/git-bulk-clean --tag v0.4.0 --locked
+cargo install --git https://github.com/takeokunn/git-bulk-clean --tag v0.6.0 --locked
 ```
 
 ### Nix — one-off run
@@ -260,7 +260,7 @@ MAINTENANCE_GHQ_ENABLE=true \
   git-bulk-clean --daemon
 ```
 
-`--aggressive` replaces `git gc --auto` with `git gc --aggressive --prune=all` and uses a full `git repack -a -d -f` instead of incremental repacking. Significantly slower, but produces the smallest possible pack files.
+`MAINTENANCE_AGGRESSIVE=true` replaces `git gc --auto` with `git gc --aggressive --prune=all` and uses a full `git repack -a -d -f` instead of incremental repacking. Significantly slower, but produces the smallest possible pack files.
 
 #### Use more parallel workers for a large collection
 
@@ -441,7 +441,8 @@ launchd agent through Home Manager.
 | `skipLfs` | `bool` | `false` | Skip `git lfs prune` |
 | `pruneTags` | `bool` | `false` | Delete local tags missing from the remote (removes unpushed tags too) |
 | `pruneBranches` | `bool` | `false` | Delete merged local branches |
-| `protectedBranches` | `[str]` | `[]` | Branches to never delete |
+| `pruneWorktrees` | `bool` | `false` | Delete worktree directories merged into the mainline or idle for 3+ days |
+| `protectedBranches` | `[str]` | `[]` | Branches to never delete; also protects worktrees checked out to them |
 | `credentialHelpers` | `bool` | `false` | Let fetch and lfs prune use configured credential helpers |
 
 ---
