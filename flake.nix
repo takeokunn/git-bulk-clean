@@ -19,7 +19,7 @@
           pkgs = pkgsFor system;
           git-bulk-clean = pkgs.rustPlatform.buildRustPackage {
             pname = "git-bulk-clean";
-            version = "0.6.1";
+            version = "0.7.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
 

@@ -252,9 +252,69 @@ fn one_repo_dry_run_output_contract() {
     let _ = fs::remove_dir_all(repo);
 }
 
+fn git_in(dir: &Path, args: &[&str]) {
+    assert!(
+        Command::new("git")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@t.com",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success(),
+        "git {args:?} failed"
+    );
+}
+
+// A repository with one commit on `main` and a detached linked worktree at
+// its tip whose admin files are four days old: merged and stale.
+fn repo_with_stale_worktree() -> (PathBuf, PathBuf) {
+    let repo = temp_repo();
+    git_in(&repo, &["checkout", "-q", "-b", "main"]);
+    fs::write(repo.join("f"), "x").unwrap();
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-q", "-m", "init"]);
+    let linked = repo.with_extension("linked");
+    git_in(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let output = Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .current_dir(&linked)
+        .output()
+        .unwrap();
+    let admin_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let past = SystemTime::now() - Duration::from_secs(4 * 24 * 60 * 60);
+    for name in ["gitdir", "HEAD", "index"] {
+        fs::File::options()
+            .write(true)
+            .open(admin_dir.join(name))
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+    let linked = fs::canonicalize(linked).unwrap();
+    (repo, linked)
+}
+
 #[test]
 fn prune_worktrees_dry_run_output_contract() {
-    let repo = temp_repo();
+    let (repo, linked) = repo_with_stale_worktree();
     let output = binary()
         .arg("--dry-run")
         .env("MAINTENANCE_REPOS", &repo)
@@ -266,9 +326,38 @@ fn prune_worktrees_dry_run_output_contract() {
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("git worktree remove -- (worktrees merged into mainline or idle 3+ days)")
+        stderr.contains(&format!(
+            "(dry-run) git worktree remove -- {} (merged into mainline)",
+            linked.display()
+        )),
+        "{stderr}"
     );
     assert!(stderr.contains("1/1 ok, 0 failed"));
+    assert!(linked.exists());
+    let _ = fs::remove_dir_all(linked);
+    let _ = fs::remove_dir_all(repo);
+}
+
+#[test]
+fn prune_worktrees_logs_each_removed_worktree() {
+    let (repo, linked) = repo_with_stale_worktree();
+    let output = binary()
+        .env("MAINTENANCE_REPOS", &repo)
+        .env("MAINTENANCE_SKIP_LFS", "true")
+        .env("MAINTENANCE_PRUNE_WORKTREES", "true")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "removed worktree {} (merged into mainline)",
+            linked.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!linked.exists());
     let _ = fs::remove_dir_all(repo);
 }
 

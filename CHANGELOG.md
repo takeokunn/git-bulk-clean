@@ -6,6 +6,29 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-10
+
+### Fixed
+
+- `MAINTENANCE_PRUNE_WORKTREES` no longer removes worktrees that are still in
+  use. A worktree created at the mainline tip counted as merged and was
+  removed on the next cycle, and idleness looked only at the last commit's
+  date. A merged or idle worktree is now removed only when its `gitdir`,
+  `HEAD`, and `index` admin files are all older than three days, no running
+  process of the invoking user has its working directory inside it (`/proc` on Linux, `lsof` on
+  macOS; removal is skipped when processes cannot be listed), its HEAD is
+  contained in a branch, remote-tracking ref, or tag, and it is not locked.
+- Each removed worktree is now logged with its reason, and each stale
+  worktree kept because it is in use or unreferenced is logged too.
+  Previously a successful removal left no trace in the log.
+
+### Changed
+
+- `--dry-run` with `MAINTENANCE_PRUNE_WORKTREES=true` lists each stale worktree
+  it would remove or keep, instead of one generic line. Producing that list
+  runs the same read-only detection as a real run, including the process
+  scan.
+
 ## [0.6.1] - 2026-09-12
 
 ### Security
@@ -137,7 +160,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Consolidated formatting, linting, build, and test validation under
   `nix flake check` and fixed issues exposed by that gate.
 
-[Unreleased]: https://github.com/takeokunn/git-bulk-clean/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/takeokunn/git-bulk-clean/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/takeokunn/git-bulk-clean/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/takeokunn/git-bulk-clean/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/takeokunn/git-bulk-clean/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/takeokunn/git-bulk-clean/compare/v0.4.0...v0.5.0

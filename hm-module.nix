@@ -106,8 +106,12 @@ in
       default = false;
       description = ''
         Delete worktree directories whose checkout is merged into the
-        mainline or has had no commit for three days. A worktree checked
-        out to a branch in protectedBranches is never deleted.
+        mainline or has had no commit for three days, once the worktree
+        has also not been created or used by git for three days. A
+        worktree that is locked, checked out to a branch in
+        protectedBranches, the working directory of a running process, or
+        holding commits no branch, remote-tracking ref, or tag contains is
+        never deleted.
       '';
     };
 

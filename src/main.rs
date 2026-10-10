@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::env;
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
@@ -34,8 +34,13 @@ const DEFAULT_REFLOG_EXPIRE: &str = "30.days.ago";
 const DEFAULT_INTERVAL_SECS: u64 = 86400;
 const MAX_WORKERS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 // A worktree whose last commit is older than this, or that is already merged
-// into the mainline, is a stale-worktree deletion candidate.
+// into the mainline, is a stale-worktree deletion candidate once it has also
+// seen no creation or git activity for this long.
 const WORKTREE_IDLE_THRESHOLD_SECS: u64 = 3 * 24 * 60 * 60;
+// lsof normally lists every process's working directory in well under a
+// second; past this it is assumed hung and the scan fails closed.
+#[cfg(target_os = "macos")]
+const LSOF_TIMEOUT: Duration = Duration::from_secs(30);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DANGEROUS_GIT_ENV: [&str; 30] = [
     "GIT_DIR",
@@ -759,11 +764,20 @@ fn phase_branches(dir: &str, protected_branches: &[String]) -> bool {
     }
 }
 
+// A worktree linked to a repository, as `git worktree list --porcelain`
+// reports it.
+struct LinkedWorktree {
+    path: String,
+    // The checked-out local branch; None when HEAD is detached.
+    branch: Option<String>,
+    locked: bool,
+}
+
 // Worktrees linked to `dir`, excluding the primary entry (`git worktree
 // list --porcelain` always lists the repository's own worktree — the bare
 // repository itself, for a bare repo — first; it must never be a removal
-// candidate). Each entry is (absolute path, checked-out local branch name).
-fn list_secondary_worktrees(dir: &str) -> Vec<(String, Option<String>)> {
+// candidate).
+fn list_secondary_worktrees(dir: &str) -> Vec<LinkedWorktree> {
     let mut command = hardened_git_command();
     with_git_config(&mut command, &[("core.hooksPath", "/dev/null")]);
     let output = command
@@ -780,16 +794,22 @@ fn list_secondary_worktrees(dir: &str) -> Vec<(String, Option<String>)> {
     }
 
     let mut entries = Vec::new();
-    let mut current: Option<(String, Option<String>)> = None;
+    let mut current: Option<LinkedWorktree> = None;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
             if let Some(entry) = current.take() {
                 entries.push(entry);
             }
-            current = Some((path.to_string(), None));
-        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
-            if let Some((_, name)) = &mut current {
-                *name = Some(branch.to_string());
+            current = Some(LinkedWorktree {
+                path: path.to_string(),
+                branch: None,
+                locked: false,
+            });
+        } else if let Some(entry) = &mut current {
+            if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+                entry.branch = Some(branch.to_string());
+            } else if line == "locked" || line.starts_with("locked ") {
+                entry.locked = true;
             }
         }
     }
@@ -843,27 +863,283 @@ fn worktree_is_idle(wt: &str) -> bool {
     now_secs.saturating_sub(commit_secs) > WORKTREE_IDLE_THRESHOLD_SECS
 }
 
+// `git worktree add` writes the admin dir's `gitdir`, and work inside the
+// worktree rewrites `HEAD` (checkout, commit) or `index` (status, add). Any
+// of them newer than the idle threshold means the worktree was created or
+// used recently. A fresh worktree at the mainline tip is trivially merged,
+// and only this check keeps it. `logs/HEAD` is not a signal: the reflog-expire phase
+// rewrites every worktree's reflog before this phase runs. An admin dir that
+// cannot be resolved or read counts as active.
+fn worktree_recently_active(wt: &str) -> bool {
+    let mut command = hardened_git_command();
+    with_git_config(&mut command, &[("core.hooksPath", "/dev/null")]);
+    let output = command
+        .args(["rev-parse", "--absolute-git-dir"])
+        .current_dir(wt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    let admin_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let threshold = Duration::from_secs(WORKTREE_IDLE_THRESHOLD_SECS);
+    let mtimes: Vec<SystemTime> = ["gitdir", "HEAD", "index"]
+        .into_iter()
+        .filter_map(|name| std::fs::metadata(admin_dir.join(name)).ok())
+        .filter_map(|metadata| metadata.modified().ok())
+        .collect();
+    // A modification time in the future fails `elapsed` and counts as recent.
+    mtimes.is_empty()
+        || mtimes
+            .iter()
+            .any(|mtime| mtime.elapsed().map_or(true, |age| age <= threshold))
+}
+
+// `git worktree remove` does not check this itself. A worktree whose HEAD is
+// contained in no branch, remote-tracking ref, or tag holds commits that only
+// its own HEAD and reflog reach; once it is removed, the reflog-expire and gc
+// phases can delete them. A failing git counts as unreferenced, so the
+// worktree is kept.
+fn worktree_head_referenced(wt: &str) -> bool {
+    let mut command = hardened_git_command();
+    with_git_config(&mut command, &[("core.hooksPath", "/dev/null")]);
+    command
+        .args([
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "--contains",
+            "HEAD",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ])
+        .current_dir(wt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.trim_ascii().is_empty())
+}
+
+// Working directories of the processes this user can inspect: a shell, an
+// editor, or a coding agent sitting in a worktree marks it as in use. None
+// when they cannot be listed.
+#[cfg(target_os = "linux")]
+fn process_cwds() -> Option<Vec<PathBuf>> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let cwds: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()))
+        })
+        // Other users' processes are unreadable and are skipped.
+        .filter_map(|entry| std::fs::read_link(entry.path().join("cwd")).ok())
+        .collect();
+    // This process's own entry is always readable, so an empty list means
+    // /proc is not the procfs it appears to be.
+    (!cwds.is_empty()).then_some(cwds)
+}
+
+#[cfg(target_os = "macos")]
+fn process_cwds() -> Option<Vec<PathBuf>> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    use std::io::Read;
+
+    // An absolute path: the Nix wrapper's PATH does not contain lsof, and a
+    // PATH lookup would run whichever binary the environment puts first.
+    let mut child = Command::new("/usr/sbin/lsof")
+        .args(["-a", "-d", "cwd", "-F", "n", "-w"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Read on another thread: the listing outgrows a pipe buffer, and lsof
+    // blocks on a full pipe and would never exit. A hung lsof (a stuck
+    // network mount) is killed rather than stalling this worker forever.
+    let mut stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now() + LSOF_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let stdout = reader.join().ok()?.ok()?;
+    let cwds: Vec<PathBuf> = stdout
+        .split(|&b| b == b'\n')
+        .filter_map(|line| line.strip_prefix(b"n"))
+        .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+        .collect();
+    // lsof always reports this process's own cwd, so an empty list means it
+    // failed whatever its exit status.
+    (!cwds.is_empty()).then_some(cwds)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_cwds() -> Option<Vec<PathBuf>> {
+    None
+}
+
+// The process listings report resolved paths. A worktree path that no longer
+// resolves has nothing running inside it.
+fn worktree_in_use(wt: &str, cwds: &[PathBuf]) -> bool {
+    let Ok(resolved) = std::fs::canonicalize(wt) else {
+        return false;
+    };
+    cwds.iter().any(|cwd| cwd.starts_with(&resolved))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoveReason {
+    Merged,
+    Idle,
+}
+
+impl RemoveReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            RemoveReason::Merged => "merged into mainline",
+            RemoveReason::Idle => "idle 3+ days",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    InUse,
+    Unreferenced,
+}
+
+impl SkipReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            SkipReason::InUse => "a running process has its working directory in it",
+            SkipReason::Unreferenced => "HEAD is on no branch, remote-tracking ref, or tag",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeAction {
+    Remove(RemoveReason),
+    Skip(SkipReason),
+}
+
+enum WorktreePlan {
+    // Each stale worktree with what to do about it. Worktrees that are not
+    // stale are absent.
+    Ready(Vec<(String, WorktreeAction)>),
+    // Process working directories could not be listed, so no stale worktree
+    // can be shown to be unused.
+    CwdScanFailed,
+}
+
+// Read-only, so the dry run shows exactly what a real run would remove. The
+// cheap checks run first; the process scan runs at most once, and only when a
+// stale worktree remains.
+fn plan_worktree_removals(dir: &str, protected_branches: &[String]) -> WorktreePlan {
+    let mainline = detect_mainline(dir);
+    let stale: Vec<(String, RemoveReason)> = list_secondary_worktrees(dir)
+        .into_iter()
+        .filter(|wt| {
+            !wt.locked
+                && !wt
+                    .branch
+                    .as_ref()
+                    .is_some_and(|b| protected_branches.contains(b))
+        })
+        .filter_map(|wt| {
+            let reason = if mainline
+                .as_deref()
+                .is_some_and(|m| worktree_is_merged(&wt.path, m))
+            {
+                RemoveReason::Merged
+            } else if worktree_is_idle(&wt.path) {
+                RemoveReason::Idle
+            } else {
+                return None;
+            };
+            (!worktree_recently_active(&wt.path)).then_some((wt.path, reason))
+        })
+        .collect();
+    if stale.is_empty() {
+        return WorktreePlan::Ready(Vec::new());
+    }
+    let Some(cwds) = process_cwds() else {
+        return WorktreePlan::CwdScanFailed;
+    };
+    WorktreePlan::Ready(
+        stale
+            .into_iter()
+            .map(|(path, reason)| {
+                let action = if !worktree_head_referenced(&path) {
+                    WorktreeAction::Skip(SkipReason::Unreferenced)
+                } else if worktree_in_use(&path, &cwds) {
+                    WorktreeAction::Skip(SkipReason::InUse)
+                } else {
+                    WorktreeAction::Remove(reason)
+                };
+                (path, action)
+            })
+            .collect(),
+    )
+}
+
 // Deletes worktree directories that are stale: fully merged into the
-// mainline, or idle for longer than `WORKTREE_IDLE_THRESHOLD_SECS`. A
-// worktree with a locally checked-out branch in `protected_branches` is
-// always skipped. Applies to both bare and non-bare repositories — worktrees
+// mainline, or idle for longer than `WORKTREE_IDLE_THRESHOLD_SECS`, and in
+// either case not created or used within that time. Locked worktrees,
+// worktrees checked out to a branch in `protected_branches`, worktrees a
+// running process sits in, and worktrees whose commits would be lost are
+// always kept. Applies to both bare and non-bare repositories — worktrees
 // can be linked to either.
 fn phase_worktrees(dir: &str, protected_branches: &[String]) -> bool {
-    let mainline = detect_mainline(dir);
+    let WorktreePlan::Ready(plan) = plan_worktree_removals(dir, protected_branches) else {
+        log(&format!(
+            "{}: cannot list process working directories; skipping worktree removal",
+            sanitize_for_log(dir)
+        ));
+        return false;
+    };
     let mut ok = true;
-    for (path, branch) in list_secondary_worktrees(dir) {
-        if branch
-            .as_ref()
-            .is_some_and(|b| protected_branches.contains(b))
-        {
-            continue;
-        }
-        let merged = mainline
-            .as_deref()
-            .is_some_and(|m| worktree_is_merged(&path, m));
-        let idle = worktree_is_idle(&path);
-        if merged || idle {
-            ok &= git(dir, &["worktree", "remove", "--", &path]);
+    for (path, action) in plan {
+        match action {
+            WorktreeAction::Remove(reason) => {
+                if git(dir, &["worktree", "remove", "--", &path]) {
+                    log(&format!(
+                        "{}: removed worktree {} ({})",
+                        sanitize_for_log(dir),
+                        sanitize_for_log(&path),
+                        reason.as_str()
+                    ));
+                } else {
+                    ok = false;
+                }
+            }
+            WorktreeAction::Skip(reason) => log(&format!(
+                "{}: kept worktree {} ({})",
+                sanitize_for_log(dir),
+                sanitize_for_log(&path),
+                reason.as_str()
+            )),
         }
     }
     ok
@@ -953,9 +1229,27 @@ fn clean_repo(repo: &RepoInfo, opts: &CleanOptions, dry_run: bool, n: usize, tot
             log("  (dry-run) git worktree prune");
         }
         if opts.prune_worktrees {
-            log(
-                "  (dry-run) git worktree remove -- (worktrees merged into mainline or idle 3+ days)",
-            );
+            match plan_worktree_removals(dir, &opts.protected_branches) {
+                WorktreePlan::Ready(plan) => {
+                    for (path, action) in plan {
+                        match action {
+                            WorktreeAction::Remove(reason) => log(&format!(
+                                "  (dry-run) git worktree remove -- {} ({})",
+                                sanitize_for_log(&path),
+                                reason.as_str()
+                            )),
+                            WorktreeAction::Skip(reason) => log(&format!(
+                                "  (dry-run) keep worktree {} ({})",
+                                sanitize_for_log(&path),
+                                reason.as_str()
+                            )),
+                        }
+                    }
+                }
+                WorktreePlan::CwdScanFailed => log(
+                    "  (dry-run) worktree removal skipped: cannot list process working directories",
+                ),
+            }
         }
         log(&format!(
             "  (dry-run) git reflog expire --expire={} --all",
@@ -1271,7 +1565,7 @@ Environment variables:
   MAINTENANCE_SKIP_LFS           true → skip git-lfs prune
   MAINTENANCE_PRUNE_TAGS         true → also delete local tags missing from the remote (fetch --prune-tags)
   MAINTENANCE_PRUNE_BRANCHES     true → delete merged local branches (non-bare only)
-  MAINTENANCE_PRUNE_WORKTREES    true → delete stale worktree dirs (merged into mainline, or idle 3+ days)
+  MAINTENANCE_PRUNE_WORKTREES    true → delete stale worktree dirs (merged into mainline or idle 3+ days, and untouched 3+ days; never locked, in use, or unreferenced)
   MAINTENANCE_PROTECTED_BRANCHES Comma-separated branch names to protect from deletion
   MAINTENANCE_CREDENTIAL_HELPERS true → let fetch and lfs prune use the configured credential helpers
 
@@ -2889,7 +3183,8 @@ mod tests {
                 .success()
         );
         // A fresh detached worktree checks out the mainline tip, so it is
-        // trivially merged into it.
+        // trivially merged into it; backdating makes it stale as well.
+        backdate_worktree_admin(&linked);
         assert!(phase_worktrees(dir, &[]));
         assert!(
             !linked.exists(),
@@ -2923,6 +3218,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        backdate_worktree_admin(&linked);
         let repo = RepoInfo {
             path: dir.to_string(),
             kind: RepoKind::Normal,
@@ -2971,6 +3267,10 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        // Backdated admin files leave the recent commit as the only reason
+        // to keep it.
+        backdate_worktree_admin(&linked);
+        assert!(plan_actions(dir).is_empty());
         assert!(phase_worktrees(dir, &[]));
         assert!(
             linked.exists(),
@@ -2995,8 +3295,9 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        // A fresh checkout at the mainline tip is trivially merged, so this
-        // worktree would otherwise be a removal candidate.
+        // A checkout at the mainline tip is trivially merged, so once
+        // backdated this worktree would otherwise be a removal candidate.
+        backdate_worktree_admin(&linked);
         let protected = vec!["protected-worktree".to_string()];
         assert!(phase_worktrees(dir, &protected));
         assert!(
@@ -3005,6 +3306,217 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&linked);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // Ages a linked worktree's admin files past the idle threshold, as if it
+    // had been created and last used days ago.
+    fn backdate_worktree_admin(linked: &Path) {
+        let output = Command::new("git")
+            .args(["rev-parse", "--absolute-git-dir"])
+            .current_dir(linked)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let admin_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        let past = SystemTime::now() - Duration::from_secs(WORKTREE_IDLE_THRESHOLD_SECS + 86400);
+        for name in ["gitdir", "HEAD", "index"] {
+            fs::File::options()
+                .write(true)
+                .open(admin_dir.join(name))
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        }
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+
+    // Commits in `wt` with author and committer dates well past the idle
+    // threshold.
+    fn commit_old(wt: &Path, file: &str) {
+        fs::write(wt.join(file), "x").unwrap();
+        git_ok(wt, &["add", "."]);
+        assert!(
+            Command::new("git")
+                .args(NO_HOOKS_NO_SIGN)
+                .args(["commit", "-m", "old work"])
+                .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+                .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+                .current_dir(wt)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn plan_actions(dir: &str) -> Vec<WorktreeAction> {
+        match plan_worktree_removals(dir, &[]) {
+            WorktreePlan::Ready(plan) => plan.into_iter().map(|(_, action)| action).collect(),
+            WorktreePlan::CwdScanFailed => panic!("process cwd scan failed"),
+        }
+    }
+
+    #[test]
+    fn phase_worktrees_keeps_freshly_created_merged_worktree() {
+        let tmp = make_temp_git_repo("phase_worktrees_fresh");
+        let dir = tmp.to_str().unwrap();
+        let linked = tmp.with_extension("linked_fresh");
+        let _ = fs::remove_dir_all(&linked);
+        git_ok(
+            &tmp,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+        // Merged into the mainline from the moment it exists, which used to
+        // make it a removal candidate before any work could start in it.
+        assert!(plan_actions(dir).is_empty());
+        assert!(phase_worktrees(dir, &[]));
+        assert!(linked.exists(), "a just-created worktree must survive");
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_worktrees_removes_idle_worktree_on_branch() {
+        let tmp = make_temp_git_repo("phase_worktrees_idle_branch");
+        let dir = tmp.to_str().unwrap();
+        let linked = tmp.with_extension("linked_idle_branch");
+        let _ = fs::remove_dir_all(&linked);
+        git_ok(
+            &tmp,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/old",
+                linked.to_str().unwrap(),
+            ],
+        );
+        commit_old(&linked, "old.txt");
+        backdate_worktree_admin(&linked);
+        assert_eq!(
+            plan_actions(dir),
+            vec![WorktreeAction::Remove(RemoveReason::Idle)]
+        );
+        assert!(phase_worktrees(dir, &[]));
+        assert!(!linked.exists(), "idle worktree on a branch is removed");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_worktrees_keeps_unreferenced_idle_worktree() {
+        let tmp = make_temp_git_repo("phase_worktrees_unreferenced");
+        let dir = tmp.to_str().unwrap();
+        let linked = tmp.with_extension("linked_unreferenced");
+        let _ = fs::remove_dir_all(&linked);
+        git_ok(
+            &tmp,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+        // A commit on a detached HEAD is reachable from nothing but that HEAD.
+        commit_old(&linked, "orphan.txt");
+        backdate_worktree_admin(&linked);
+        assert_eq!(
+            plan_actions(dir),
+            vec![WorktreeAction::Skip(SkipReason::Unreferenced)]
+        );
+        assert!(phase_worktrees(dir, &[]));
+        assert!(
+            linked.exists(),
+            "removing it would let gc delete its only commit"
+        );
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn phase_worktrees_keeps_worktree_with_running_process() {
+        let tmp = make_temp_git_repo("phase_worktrees_in_use");
+        let dir = tmp.to_str().unwrap();
+        let linked = tmp.with_extension("linked_in_use");
+        let _ = fs::remove_dir_all(&linked);
+        git_ok(
+            &tmp,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+        let subdir = linked.join("sub");
+        fs::create_dir(&subdir).unwrap();
+        backdate_worktree_admin(&linked);
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(&subdir)
+            .spawn()
+            .unwrap();
+        let actions = plan_actions(dir);
+        let phase_ok = phase_worktrees(dir, &[]);
+        let survived = linked.exists();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(actions, vec![WorktreeAction::Skip(SkipReason::InUse)]);
+        assert!(phase_ok);
+        assert!(survived, "a worktree a process sits in must survive");
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn phase_worktrees_skips_locked_worktree() {
+        let tmp = make_temp_git_repo("phase_worktrees_locked");
+        let dir = tmp.to_str().unwrap();
+        let linked = tmp.with_extension("linked_locked");
+        let _ = fs::remove_dir_all(&linked);
+        git_ok(
+            &tmp,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+        git_ok(&tmp, &["worktree", "lock", linked.to_str().unwrap()]);
+        backdate_worktree_admin(&linked);
+        assert!(list_secondary_worktrees(dir)[0].locked);
+        assert!(plan_actions(dir).is_empty());
+        // git refuses to remove a locked worktree; skipping it up front keeps
+        // that refusal from failing the repository every cycle.
+        assert!(phase_worktrees(dir, &[]));
+        assert!(linked.exists());
+        git_ok(&tmp, &["worktree", "unlock", linked.to_str().unwrap()]);
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn worktree_in_use_compares_path_components() {
+        let tmp = unique_temp_dir("worktree_in_use_components");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("w1/sub")).unwrap();
+        fs::create_dir_all(tmp.join("w10")).unwrap();
+        let tmp = fs::canonicalize(&tmp).unwrap();
+        let w1 = tmp.join("w1");
+        let w1 = w1.to_str().unwrap();
+        assert!(!worktree_in_use(w1, &[tmp.join("w10")]));
+        assert!(worktree_in_use(w1, &[tmp.join("w1/sub")]));
+        assert!(worktree_in_use(w1, &[tmp.join("w1")]));
+        assert!(!worktree_in_use(
+            tmp.join("gone").to_str().unwrap(),
+            &[tmp.join("gone")]
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn process_cwds_lists_this_process() {
+        let cwd = fs::canonicalize(env::current_dir().unwrap()).unwrap();
+        let cwds = process_cwds().expect("process cwd scan should succeed");
+        assert!(cwds.contains(&cwd), "{cwd:?} missing from {cwds:?}");
     }
 
     #[test]
@@ -3057,10 +3569,11 @@ mod tests {
         let entries = list_secondary_worktrees(dir);
         assert_eq!(entries.len(), 1);
         assert_eq!(
-            entries[0].0,
+            entries[0].path,
             fs::canonicalize(&linked).unwrap().to_string_lossy()
         );
-        assert_eq!(entries[0].1, None, "detached worktree has no branch");
+        assert_eq!(entries[0].branch, None, "detached worktree has no branch");
+        assert!(!entries[0].locked);
         let _ = fs::remove_dir_all(&linked);
         let _ = fs::remove_dir_all(&tmp);
     }

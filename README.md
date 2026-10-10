@@ -132,7 +132,7 @@ Each repository runs through these phases in order. All phases are attempted eve
 | 1 | `git fetch --all --prune` (`--prune-tags` added when `MAINTENANCE_PRUNE_TAGS=true`; credential helpers only when `MAINTENANCE_CREDENTIAL_HELPERS=true`) | always |
 | 2 | `git pack-refs --all` | always |
 | 3 | `git worktree prune` | non-bare |
-| 4 | `git worktree remove -- <stale>` | `MAINTENANCE_PRUNE_WORKTREES=true` (merged into mainline, or idle 3+ days) |
+| 4 | `git worktree remove -- <stale>` | `MAINTENANCE_PRUNE_WORKTREES=true` (merged into mainline, or idle 3+ days; see [Worktree pruning](#worktree-pruning)) |
 | 5 | `git reflog expire --expire=<REFLOG_EXPIRE> --all` | always |
 | 6 | `git rerere gc` | always |
 | 7 | `git notes prune` | always |
@@ -146,6 +146,30 @@ Each repository runs through these phases in order. All phases are attempted eve
 | 13 | `git submodule sync --recursive` + `foreach git gc --auto` | `.gitmodules` exists, non-bare |
 | 14 | `git lfs prune` (credential helpers only when `MAINTENANCE_CREDENTIAL_HELPERS=true`) | `filter.lfs` configured in repo |
 
+### Worktree pruning
+
+With `MAINTENANCE_PRUNE_WORKTREES=true`, a linked worktree is stale when its
+HEAD is merged into the mainline or its last commit is more than three days
+old. A stale worktree is removed only when all of these hold:
+
+- Its admin files `gitdir` (written on creation), `HEAD`, and `index`
+  (rewritten by checkout, commit, status, and add) are all older than three
+  days. A worktree created at the mainline tip is merged from the start, so
+  this keeps a new worktree until it has been left alone.
+- No running process of the invoking user has its working directory inside it. Processes are
+  listed from `/proc` on Linux and with `/usr/sbin/lsof` on macOS; when they
+  cannot be listed, no worktree is removed and the repository is counted as
+  failed.
+- Its HEAD is contained in a branch, remote-tracking ref, or tag. Commits
+  reachable only from a detached HEAD would otherwise be deleted by the
+  reflog and gc phases that follow.
+- It is not locked (`git worktree lock`) and not checked out to a branch in
+  `MAINTENANCE_PROTECTED_BRANCHES`.
+
+`--force` is never passed, so git itself refuses a worktree with modified or
+untracked files. Every removal is logged with its reason, and so is every
+stale worktree kept because it is in use or unreferenced.
+
 > **Why run `loose-objects` and `incremental-repack` before `gc`?**
 > `git gc --auto` only triggers when internal thresholds are exceeded.
 > `loose-objects` runs unconditionally. `incremental-repack` then runs when a pack is
@@ -157,11 +181,11 @@ Each repository runs through these phases in order. All phases are attempted eve
 
 ### Cargo (from the current release tag)
 
-This project is not published on crates.io. Install the current `v0.6.1`
+This project is not published on crates.io. Install the current `v0.7.0`
 source tag directly from GitHub:
 
 ```sh
-cargo install --git https://github.com/takeokunn/git-bulk-clean --tag v0.6.1 --locked
+cargo install --git https://github.com/takeokunn/git-bulk-clean --tag v0.7.0 --locked
 ```
 
 ### Nix — one-off run
@@ -200,7 +224,7 @@ All repository discovery and tuning is done via environment variables — there 
 |------|-------------|
 | _(none)_ | One-shot: clean every discovered repository and exit |
 | `--daemon` | Loop forever, sleeping `MAINTENANCE_INTERVAL` seconds between cycles |
-| `--dry-run` | Print repository-changing Git commands without running them; read-only repository, mainline, and LFS detection still runs |
+| `--dry-run` | Print repository-changing Git commands without running them; read-only repository, mainline, worktree, and LFS detection still runs |
 | `--list` | Print all discovered repositories (`norm` / `bare`) and exit |
 | `--generate-completions SHELL` | Print the completion script for `bash`, `zsh`, or `fish` and exit |
 | `-V`, `--version` | Print version and exit |
@@ -334,7 +358,7 @@ All configuration is via environment variables — no config file required.
 | `MAINTENANCE_SKIP_LFS` | `false` | `true` → skip `git lfs prune` even if LFS is configured |
 | `MAINTENANCE_PRUNE_TAGS` | `false` | `true` → `git fetch --prune-tags`: deletes local tags missing from the remote (**including unpushed tags**) |
 | `MAINTENANCE_PRUNE_BRANCHES` | `false` | `true` → delete local branches merged into the mainline (non-bare only) |
-| `MAINTENANCE_PRUNE_WORKTREES` | `false` | `true` → delete worktree directories merged into the mainline, or idle for 3+ days |
+| `MAINTENANCE_PRUNE_WORKTREES` | `false` | `true` → delete worktree directories merged into the mainline, or idle for 3+ days, that are not in use ([Worktree pruning](#worktree-pruning)) |
 | `MAINTENANCE_PROTECTED_BRANCHES` | _(empty)_ | Comma-separated branch names to never delete (mainline is always protected); also skips worktrees checked out to a protected branch |
 | `MAINTENANCE_CREDENTIAL_HELPERS` | `false` | `true` → `git fetch` and `git lfs prune` use the credential helpers from git config, so authenticated HTTPS remotes work unattended. Off: every helper is reset and such remotes fail to fetch |
 
@@ -361,8 +385,9 @@ tags when tag pruning is enabled, and merged local branches when branch pruning
 is enabled. Keep independent backups of irreplaceable work and inspect both
 `--list` and `--dry-run` before the first changing run. Dry-run prevents the
 maintenance commands from changing repositories, but it still invokes Git for
-read-only repository, mainline, and LFS detection and checks the filesystem for
-submodule metadata.
+read-only repository, mainline, worktree, and LFS detection, lists process
+working directories when a worktree is a removal candidate, and checks the
+filesystem for submodule metadata.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting and the supported
 security scope.
@@ -441,7 +466,7 @@ launchd agent through Home Manager.
 | `skipLfs` | `bool` | `false` | Skip `git lfs prune` |
 | `pruneTags` | `bool` | `false` | Delete local tags missing from the remote (removes unpushed tags too) |
 | `pruneBranches` | `bool` | `false` | Delete merged local branches |
-| `pruneWorktrees` | `bool` | `false` | Delete worktree directories merged into the mainline or idle for 3+ days |
+| `pruneWorktrees` | `bool` | `false` | Delete worktree directories merged into the mainline or idle for 3+ days, that are not in use |
 | `protectedBranches` | `[str]` | `[]` | Branches to never delete; also protects worktrees checked out to them |
 | `credentialHelpers` | `bool` | `false` | Let fetch and lfs prune use configured credential helpers |
 

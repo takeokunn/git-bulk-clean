@@ -42,8 +42,10 @@ user or by untrusted automation.
 *--dry-run*
 	Print repository-changing Git commands without running them. Read-only
 	detection commands still run to validate repositories and determine bare
-	status, mainline branches, and LFS configuration. Useful for auditing the
-	maintenance plan before a changing run.
+	status, mainline branches, stale worktrees, and LFS configuration, and
+	process working directories are listed when a worktree is a removal
+	candidate. Each stale worktree that would be removed or kept is printed.
+	Useful for auditing the maintenance plan before a changing run.
 
 *--list*
 	Print all discovered repositories with their type (_norm_ for a normal
@@ -122,11 +124,17 @@ user or by untrusted automation.
 *MAINTENANCE_PRUNE_WORKTREES*
 	Set to _true_ to delete linked worktree directories whose checked-out
 	commit is merged into the mainline, or whose last commit is more than
-	three days old. The primary worktree is never a candidate, and a
-	worktree checked out to a branch listed in
-	_MAINTENANCE_PROTECTED_BRANCHES_ is skipped. Never passes _--force_,
-	so a worktree with uncommitted changes is left alone by git itself.
-	Default: _false_.
+	three days old, once the worktree's _gitdir_, _HEAD_, and _index_
+	admin files are all more than three days old too. The primary worktree
+	is never a candidate. A worktree is kept when it is locked, checked
+	out to a branch listed in _MAINTENANCE_PROTECTED_BRANCHES_, the
+	working directory of a running process of the invoking user (read from _/proc_ on Linux
+	and _/usr/sbin/lsof_ on macOS), or its HEAD is contained in no branch,
+	remote-tracking ref, or tag. When process working directories cannot
+	be listed, no worktree is removed and the repository counts as
+	failed. Each removal is logged with its reason. Never passes
+	_--force_, so a worktree with uncommitted changes is left alone by git
+	itself. Default: _false_.
 
 *MAINTENANCE_PROTECTED_BRANCHES*
 	Comma-separated list of branch names to never delete, even when
@@ -152,7 +160,7 @@ remaining phases and repositories.
 . *git fetch --all --prune* — fetch from all remotes, removing stale remote-tracking branches. Adds _--prune-tags_ when _MAINTENANCE_PRUNE_TAGS=true_. Uses the configured credential helpers only when _MAINTENANCE_CREDENTIAL_HELPERS=true_.
 . *git pack-refs --all* — pack loose reference files into a single packed-refs file.
 . *git worktree prune* — remove stale worktree administrative files. Skipped for bare repositories.
-. *git worktree remove -- <stale>* — delete worktree directories merged into the mainline or idle for three days. Only runs when _MAINTENANCE_PRUNE_WORKTREES=true_.
+. *git worktree remove -- <stale>* — delete worktree directories merged into the mainline or idle for three days that are not in use (see _MAINTENANCE_PRUNE_WORKTREES_). Only runs when _MAINTENANCE_PRUNE_WORKTREES=true_.
 . *git reflog expire --expire=<MAINTENANCE_REFLOG_EXPIRE> --all* — expire old reflog entries according to the configured cutoff.
 . *git rerere gc* — clean up stale conflict-resolution records from the rerere cache. Always runs; no-op on repositories that do not use rerere.
 . *git notes prune* — remove note refs whose annotated objects no longer exist. Always runs.
@@ -194,8 +202,8 @@ backups of irreplaceable work and inspect both *--list* and *--dry-run* before
 the first changing run.
 
 Dry-run prevents maintenance commands from changing repositories, but it is
-not a sandbox: Git is still invoked for read-only repository, mainline, and LFS
-detection, the filesystem is checked for submodule metadata, and repository-local
+not a sandbox: Git is still invoked for read-only repository, mainline, worktree,
+and LFS detection, the filesystem is checked for submodule metadata, and repository-local
 configuration may select helper programs. Do not target
 shared, other-user-writable, or otherwise untrusted repositories. With
 _MAINTENANCE_CREDENTIAL_HELPERS=true_, each repository's git config also
